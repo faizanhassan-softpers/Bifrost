@@ -28,7 +28,6 @@ from segment_anything import SamPredictor, sam_model_registry
 import matplotlib.pyplot as plt
 import torch.nn as nn
 import torch.distributed as dist
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
 predictor = SamPredictor(sam)
@@ -53,26 +52,10 @@ state_dict = load_state_dict(model_ckpt, location='cuda')
 if torch.cuda.device_count() > 1:
     print(f"Using {torch.cuda.device_count()} GPUs!")
     
-    # Option 1: Use DataParallel (simpler but less efficient)
-    # model = nn.DataParallel(model)
-    # model.load_state_dict(state_dict)
-    # model = model.cuda()
-    
-    # Option 2: Use device_map="auto" for better efficiency (similar to LLaVA)
-    # First load the model to CPU
+    # Use DataParallel for multi-GPU support
     model.load_state_dict(state_dict)
-    
-    # Then use accelerate to distribute the model across GPUs
-    with init_empty_weights():
-        model = create_model(model_config)
-    
-    # Load and dispatch the model across available GPUs
-    model = load_checkpoint_and_dispatch(
-        model, 
-        model_ckpt, 
-        device_map="auto",
-        no_split_module_classes=["ControlNet", "UNetModel", "VAEDecoder", "VAEEncoder"]
-    )
+    model = nn.DataParallel(model)
+    model = model.cuda()
 else:
     # Single GPU case
     model.load_state_dict(state_dict)
@@ -81,13 +64,13 @@ else:
 # Create sampler
 ddim_sampler = DDIMSampler(model)
 
-# Function to get the actual model (handles both DataParallel and distributed cases)
+# Function to get the actual model (handles DataParallel case)
 def get_actual_model(model):
     if isinstance(model, nn.DataParallel):
         return model.module
     return model
 
-# Function to handle model method calls (handles both DataParallel and distributed cases)
+# Function to handle model method calls (handles DataParallel case)
 def call_model_method(model, method_name, *args, **kwargs):
     actual_model = get_actual_model(model)
     method = getattr(actual_model, method_name)
