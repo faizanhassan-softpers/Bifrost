@@ -520,6 +520,12 @@ if __name__ == '__main__':
     sobel_color = False
     sobel_threshold = 50
     start_time = time.time()
+    
+    # Create necessary folders if they don't exist
+    os.makedirs('/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input', exist_ok=True)
+    os.makedirs('/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask', exist_ok=True)
+    os.makedirs('/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth', exist_ok=True)
+    os.makedirs('/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen', exist_ok=True)
 
     # using zero123 to generate new image with novel view
     # given_image = cv2.imread(opt.input_image, cv2.IMREAD_UNCHANGED)
@@ -535,32 +541,34 @@ if __name__ == '__main__':
         exit()
 
     # reference image
+    print(f"Loading reference image from {ref_image_path}")
+    if not os.path.exists(ref_image_path):
+        print(f"ERROR: Reference image not found at {ref_image_path}")
+        exit(1)
+        
     image = cv2.imread(ref_image_path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        print(f"ERROR: Failed to load reference image from {ref_image_path}")
+        exit(1)
+        
     image = cv2.cvtColor(image.copy(), cv2.COLOR_BGR2RGB)
     if flip_image:
         image = cv2.flip(image, 1)
 
     h, w = image.shape[0], image.shape[1]
 
-
-
     # background image
+    print(f"Loading background image from {bg_image_path}")
+    if not os.path.exists(bg_image_path):
+        print(f"ERROR: Background image not found at {bg_image_path}")
+        exit(1)
+        
     back_image = cv2.imread(bg_image_path).astype(np.uint8)
+    if back_image is None:
+        print(f"ERROR: Failed to load background image from {bg_image_path}")
+        exit(1)
+        
     back_image = cv2.cvtColor(back_image, cv2.COLOR_BGR2RGB)
-    '''
-    image_gry = cv2.imread(ref_image_path, cv2.IMREAD_GRAYSCALE)
-
-    # mask = (image[:,:,-1] > 128).astype(np.uint8)
-    mask = (image_gry[:, :] < 253).astype(np.uint8)
-    # image = image[:,:,:-1]
-    image = cv2.cvtColor(image.copy(), cv2.COLOR_BGR2RGB)
-    h, w = image.shape[0], image.shape[1]
-    ref_image = image*mask[:, :, None]
-    ref_image = image 
-    ref_mask = mask
-    '''
-    # Check device before every major operation to ensure consistency
-    print(f"DPT model device check: {next(dpt_model.parameters()).device}")
     
     # Use SAM to predict the mask for reference image
     with torch.cuda.device(device_sam.index):
@@ -574,10 +582,23 @@ if __name__ == '__main__':
                                         multimask_output=True)
     # save the mask image
     mask = masks[1].astype(np.uint8)
-    # cv2.imwrite(ref_image_mask_path, mask)
+    cv2.imwrite(ref_image_mask_path, mask * 255)
+    print(f"Saved reference mask to {ref_image_mask_path}")
+    
+    # Load the mask and verify it
+    print(f"Loading reference mask from {ref_image_mask_path}")
+    if not os.path.exists(ref_image_mask_path):
+        print(f"ERROR: Reference mask not found at {ref_image_mask_path}")
+        exit(1)
+        
     mask = cv2.imread(ref_image_mask_path, cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        print(f"ERROR: Failed to load reference mask from {ref_image_mask_path}")
+        exit(1)
+        
     ref_mask = (mask[:, :] > 0).astype(np.uint8)
     ref_image = image
+    
     if mode == 'draw':
         h_back, w_back = back_image.shape[0], back_image.shape[1]
         # Use SAM to predict the mask for background image
@@ -592,27 +613,50 @@ if __name__ == '__main__':
                                             multimask_output=True)
         # save the mask image
         back_mask = masks[1].astype(np.uint8)
-        # cv2.imwrite(bg_mask_path, back_mask)
+        cv2.imwrite(bg_mask_path, back_mask * 255)
+        print(f"Saved background mask to {bg_mask_path}")
 
     # Get the depth map using DPT
+    print("Running depth estimation...")
     run_dpt(input_folder, output_folder)
+    print("Depth estimation completed")
 
-
-    # transform reference image style to the background image style
-    # aug = A.Compose([A.FDA([back_image], p=1, read_fn=lambda x: x)])
-    # transfered_ref_image = aug(image=image)['image']
-    # ref_image = transfered_ref_image
-
+    # Check if depth maps exist
+    print(f"Checking for depth maps in {output_folder}")
+    if not os.path.exists(os.path.join(output_folder, 'background.png')):
+        print(f"ERROR: Background depth map not found at {os.path.join(output_folder, 'background.png')}")
+        exit(1)
+    if not os.path.exists(os.path.join(output_folder, 'object.png')):
+        print(f"ERROR: Object depth map not found at {os.path.join(output_folder, 'object.png')}")
+        exit(1)
 
     tar_mask = np.zeros(back_image.shape[:2], np.uint8)
     tar_mask[int((bg_mask[1])*back_image.shape[0]):int((bg_mask[1]+bg_mask[3])*back_image.shape[0]),
                 int((bg_mask[0])*back_image.shape[1]):int((bg_mask[0]+bg_mask[2])*back_image.shape[1])] = 1
 
-
     # read the depth map predicted by DPT
-    back_depth = cv2.imread('/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth/background.png', cv2.IMREAD_UNCHANGED)
-    ref_depth = cv2.imread('/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth/object.png', cv2.IMREAD_UNCHANGED)
-    ref_depth = ref_depth*ref_mask
+    print(f"Loading background depth from {os.path.join(output_folder, 'background.png')}")
+    back_depth = cv2.imread(os.path.join(output_folder, 'background.png'), cv2.IMREAD_UNCHANGED)
+    if back_depth is None:
+        print(f"ERROR: Could not read background depth map")
+        exit(1)
+        
+    print(f"Loading object depth from {os.path.join(output_folder, 'object.png')}")
+    ref_depth = cv2.imread(os.path.join(output_folder, 'object.png'), cv2.IMREAD_UNCHANGED)
+    if ref_depth is None:
+        print(f"ERROR: Could not read object depth map")
+        exit(1)
+        
+    print(f"Depth map shapes - Background: {back_depth.shape}, Object: {ref_depth.shape}, Reference mask: {ref_mask.shape}")
+    
+    # Make sure ref_depth and ref_mask have same dimensions
+    if ref_depth.shape[:2] != ref_mask.shape[:2]:
+        print(f"WARNING: Depth map shape {ref_depth.shape[:2]} doesn't match mask shape {ref_mask.shape[:2]}")
+        ref_mask = cv2.resize(ref_mask, (ref_depth.shape[1], ref_depth.shape[0]))
+        print(f"Resized mask to {ref_mask.shape}")
+        
+    ref_depth = ref_depth * ref_mask
+    
     if flip_image:
         ref_depth = cv2.flip(ref_depth, 1)
 
@@ -625,10 +669,12 @@ if __name__ == '__main__':
     cropped_ref_mask = ref_mask[y1:y2,x1:x2]
 
     # fuse the depth and mask
+    print("Fusing depth and mask...")
     fused_depth, fused_mask, occluded_mask = depth_mask_fusion(back_depth, ref_depth, bg_mask, cropped_ref_mask, depth, mode=mode)
     fused_mask = fused_mask*255
     cv2.imwrite(fused_mask_path, fused_mask)
     cv2.imwrite(fused_depth_path, fused_depth)
+    print(f"Saved fused outputs to {fused_mask_path} and {fused_depth_path}")
 
     # background mask
     if mode == 'place' and pixel_num != None: 
@@ -637,14 +683,14 @@ if __name__ == '__main__':
     elif mode == 'draw':
         tar_mask = cv2.imread(bg_mask_path, cv2.IMREAD_UNCHANGED)
         tar_mask = (tar_mask[:, :] > 0).astype(np.uint8)
-    # tar_mask = tar_mask < 128
-    # tar_mask = tar_mask.astype(np.uint8)
+    
     if flip_image:
         ref_mask = cv2.flip(ref_mask, 1)
 
     tar_depth = cv2.imread(fused_depth_path, cv2.IMREAD_UNCHANGED)
+    print("Running inference...")
     gen_image = inference_single_image(ref_image, ref_mask, back_image.copy(), tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold)
-    # print("gen_image: ", gen_image.shape)
+    
     h,w = back_image.shape[0], back_image.shape[0]
     ref_image = cv2.resize(ref_image, (w,h))
     tar_depth = cv2.resize(tar_depth, (w,h))
@@ -653,8 +699,9 @@ if __name__ == '__main__':
 
     cv2.imwrite(save_compose_path, vis_image[:,:,::-1])
     cv2.imwrite(save_path, gen_image[:,:,::-1])
+    print(f"Results saved to {save_path} and {save_compose_path}")
     end_time = time.time()
-    print("Time: ", end_time-start_time)
+    print(f"Total processing time: {end_time-start_time:.2f} seconds")
 
     '''
     # ==== Example for inferring VITON-HD Test dataset ===
