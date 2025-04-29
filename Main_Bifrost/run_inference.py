@@ -41,6 +41,18 @@ import matplotlib.pyplot as plt
 import torch.nn as nn
 import torch.distributed as dist
 
+# Create a wrapper class that maintains access to model attributes when using DataParallel
+class DataParallelWithAttributes(nn.DataParallel):
+    """
+    DataParallel wrapper that allows accessing model attributes even after wrapping.
+    """
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            # If attribute not found in DataParallel, check the module
+            return getattr(self.module, name)
+
 # Initialize GPU settings
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"Number of GPUs: {torch.cuda.device_count()}")
@@ -51,33 +63,51 @@ for i in range(torch.cuda.device_count()):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Loading SAM model on device: {device}")
 
-# Load SAM model and move to device
-sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
-sam = sam.to(device)
+try:
+    # Load SAM model and move to device
+    sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
+    sam = sam.to(device)
 
-# Initialize the predictor with the base model
-predictor = SamPredictor(sam)
+    # Initialize the predictor with the base model
+    print("Creating SamPredictor...")
+    predictor = SamPredictor(sam)
+    print("SamPredictor created successfully")
 
-# Check available GPUs for SAM
-print(f"CUDA device count before SAM DataParallel: {torch.cuda.device_count()}")
+    # Check available GPUs for SAM
+    print(f"CUDA device count before SAM DataParallel: {torch.cuda.device_count()}")
 
-# Now wrap with DataParallelWithAttributes for faster processing if multiple GPUs are available
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs for SAM model's forward pass")
-    # Use our custom wrapper to maintain attribute access
-    sam = DataParallelWithAttributes(sam)
-    print(f"SAM model is using DataParallel: {isinstance(sam, nn.DataParallel)}")
-    # Verify we can still access attributes through the wrapper
-    print(f"Can still access image_encoder: {hasattr(sam, 'image_encoder')}")
-else:
-    print(f"Using single GPU for SAM, device: {next(sam.parameters()).device}")
+    # Now wrap with DataParallelWithAttributes for faster processing if multiple GPUs are available
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for SAM model's forward pass")
+        # Use our custom wrapper to maintain attribute access
+        print("Creating DataParallelWithAttributes wrapper for SAM...")
+        # First verify the class exists
+        print(f"DataParallelWithAttributes class exists: {DataParallelWithAttributes is not None}")
+        sam = DataParallelWithAttributes(sam)
+        print(f"SAM model is using DataParallel: {isinstance(sam, nn.DataParallel)}")
+        # Verify we can still access attributes through the wrapper
+        print(f"Can still access image_encoder: {hasattr(sam, 'image_encoder')}")
+    else:
+        print(f"Using single GPU for SAM, device: {next(sam.parameters()).device}")
+except Exception as e:
+    print(f"Error initializing SAM model: {type(e).__name__}: {e}")
+    import traceback
+    traceback.print_exc()
+    print("Continuing without DataParallel for SAM...")
 
 print(f"Loading DPT model...")
-dpt_model, transform = initialize_dpt_model(
-    model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt',
-    custom_data_parallel=DataParallelWithAttributes
-)
-dpt_model = dpt_model.to(device)
+try:
+    dpt_model, transform = initialize_dpt_model(
+        model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt',
+        custom_data_parallel=DataParallelWithAttributes
+    )
+    dpt_model = dpt_model.to(device)
+    print("DPT model loaded successfully")
+except Exception as e:
+    print(f"Error initializing DPT model: {type(e).__name__}: {e}")
+    import traceback
+    traceback.print_exc()
+    print("Continuing with limited functionality...")
 
 save_memory = False
 disable_verbosity()
@@ -89,30 +119,43 @@ model_ckpt = config.pretrained_model
 model_config = config.config_file
 
 # Create model on CPU first
-model = create_model(model_config).cpu()
-state_dict = load_state_dict(model_ckpt, location='cpu')  # Load to CPU first
+try:
+    print("Creating model...")
+    model = create_model(model_config).cpu()
+    print("Loading state dict...")
+    state_dict = load_state_dict(model_ckpt, location='cpu')  # Load to CPU first
 
-# Check if multiple GPUs are available
-print(f"CUDA device count before model init: {torch.cuda.device_count()}")
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs for inference!")
-    
-    # Load state dict on CPU first
-    model.load_state_dict(state_dict)
-    
-    # Create DataParallelWithAttributes wrapper first, then move to CUDA
-    model = DataParallelWithAttributes(model)
-    model = model.cuda()
-    print(f"Model is using DataParallel: {isinstance(model, nn.DataParallel)}")
-    print(f"Model device: {next(model.parameters()).device}")
-else:
-    # Single GPU case
-    model.load_state_dict(state_dict)
-    model = model.cuda()
-    print(f"Using single GPU, device: {next(model.parameters()).device}")
+    # Check if multiple GPUs are available
+    print(f"CUDA device count before model init: {torch.cuda.device_count()}")
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for inference!")
+        
+        # Load state dict on CPU first
+        print("Loading state dict to model...")
+        model.load_state_dict(state_dict)
+        
+        # Create DataParallelWithAttributes wrapper first, then move to CUDA
+        print("Creating DataParallelWithAttributes wrapper for main model...")
+        model = DataParallelWithAttributes(model)
+        print("Moving model to CUDA...")
+        model = model.cuda()
+        print(f"Model is using DataParallel: {isinstance(model, nn.DataParallel)}")
+        print(f"Model device: {next(model.parameters()).device}")
+    else:
+        # Single GPU case
+        model.load_state_dict(state_dict)
+        model = model.cuda()
+        print(f"Using single GPU, device: {next(model.parameters()).device}")
 
-# Create sampler
-ddim_sampler = DDIMSampler(model)
+    # Create sampler
+    print("Creating DDIMSampler...")
+    ddim_sampler = DDIMSampler(model)
+    print("DDIMSampler created successfully")
+except Exception as e:
+    print(f"Error initializing main model: {type(e).__name__}: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)  # Exit if the main model fails to load
 
 # Function to get the actual model (handles DataParallel case)
 def get_actual_model(model):
@@ -276,18 +319,6 @@ def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
     gen_image[y1+m :y2-m, x1+m:x2-m, :] =  pred[m:-m, m:-m]
     return gen_image
 
-
-# Create a wrapper class that maintains access to model attributes when using DataParallel
-class DataParallelWithAttributes(nn.DataParallel):
-    """
-    DataParallel wrapper that allows accessing model attributes even after wrapping.
-    """
-    def __getattr__(self, name):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            # If attribute not found in DataParallel, check the module
-            return getattr(self.module, name)
 
 # Add a function to manage GPU memory
 def manage_gpu_memory():
