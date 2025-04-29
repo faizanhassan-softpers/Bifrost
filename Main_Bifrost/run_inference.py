@@ -6,9 +6,20 @@ import random
 import os
 import sys
 import time
+
+# Make sure this is at the top before any other imports that might use CUDA
 # Set CUDA_VISIBLE_DEVICES to use specific GPUs
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 print(f"CUDA_VISIBLE_DEVICES set to: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+
+# Import GPU utilities
+try:
+    from utils_gpu import verify_multi_gpu_setup, print_gpu_utilization, print_pytorch_gpu_memory, optimize_gpu_memory
+    has_gpu_utils = True
+except ImportError:
+    print("Warning: utils_gpu.py not found, some GPU monitoring capabilities will be disabled")
+    has_gpu_utils = False
+
 # sys.path.insert(0, '/home/ec2-user/SageMaker/Codes/ControlNet')
 
 from pytorch_lightning import seed_everything
@@ -40,26 +51,32 @@ for i in range(torch.cuda.device_count()):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Loading SAM model on device: {device}")
 
-# Load SAM model on CPU first
+# Load SAM model and move to device
 sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
+sam = sam.to(device)
 
-# Check available GPUs again
-print(f"CUDA device count before SAM init: {torch.cuda.device_count()}")
-
-# Use DataParallel for SAM model if multiple GPUs are available
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs for SAM model")
-    sam = nn.DataParallel(sam)
-    sam = sam.cuda()
-    print(f"SAM model is using DataParallel: {isinstance(sam, nn.DataParallel)}")
-else:
-    sam = sam.to(device)
-    print(f"Using single GPU for SAM, device: {next(sam.parameters()).device}")
-
+# Initialize the predictor with the base model
 predictor = SamPredictor(sam)
 
+# Check available GPUs for SAM
+print(f"CUDA device count before SAM DataParallel: {torch.cuda.device_count()}")
+
+# Now wrap with DataParallelWithAttributes for faster processing if multiple GPUs are available
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs for SAM model's forward pass")
+    # Use our custom wrapper to maintain attribute access
+    sam = DataParallelWithAttributes(sam)
+    print(f"SAM model is using DataParallel: {isinstance(sam, nn.DataParallel)}")
+    # Verify we can still access attributes through the wrapper
+    print(f"Can still access image_encoder: {hasattr(sam, 'image_encoder')}")
+else:
+    print(f"Using single GPU for SAM, device: {next(sam.parameters()).device}")
+
 print(f"Loading DPT model...")
-dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
+dpt_model, transform = initialize_dpt_model(
+    model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt',
+    custom_data_parallel=DataParallelWithAttributes
+)
 dpt_model = dpt_model.to(device)
 
 save_memory = False
@@ -83,8 +100,8 @@ if torch.cuda.device_count() > 1:
     # Load state dict on CPU first
     model.load_state_dict(state_dict)
     
-    # Create DataParallel wrapper first, then move to CUDA
-    model = nn.DataParallel(model)
+    # Create DataParallelWithAttributes wrapper first, then move to CUDA
+    model = DataParallelWithAttributes(model)
     model = model.cuda()
     print(f"Model is using DataParallel: {isinstance(model, nn.DataParallel)}")
     print(f"Model device: {next(model.parameters()).device}")
@@ -259,6 +276,18 @@ def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
     gen_image[y1+m :y2-m, x1+m:x2-m, :] =  pred[m:-m, m:-m]
     return gen_image
 
+
+# Create a wrapper class that maintains access to model attributes when using DataParallel
+class DataParallelWithAttributes(nn.DataParallel):
+    """
+    DataParallel wrapper that allows accessing model attributes even after wrapping.
+    """
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            # If attribute not found in DataParallel, check the module
+            return getattr(self.module, name)
 
 # Add a function to manage GPU memory
 def manage_gpu_memory():
@@ -497,8 +526,19 @@ if __name__ == '__main__':
     # Set the CUDA device and verify all GPUs are detected
     if torch.cuda.is_available():
         print(f"\nFinal GPU verification before starting inference:")
-        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
-        print(f"PyTorch CUDA device count: {torch.cuda.device_count()}")
+        
+        # Use our new utilities if available
+        if has_gpu_utils:
+            verify_multi_gpu_setup()
+            print_gpu_utilization()
+            print_pytorch_gpu_memory()
+        else:
+            print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+            print(f"PyTorch CUDA device count: {torch.cuda.device_count()}")
+            
+            # Print GPU information 
+            for i in range(torch.cuda.device_count()):
+                print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
         
         # If we only have 1 GPU but should have more, try resetting CUDA
         if torch.cuda.device_count() < 2 and ',' in os.environ.get("CUDA_VISIBLE_DEVICES", "0"):
@@ -509,23 +549,27 @@ if __name__ == '__main__':
             
             # Try updating the environment and reloading CUDA
             os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-            torch.cuda.empty_cache()
+            
+            # Use our memory optimization utility if available
+            if has_gpu_utils:
+                optimize_gpu_memory()
+            else:
+                torch.cuda.empty_cache()
             
             # Print what we have
             print(f"Devices after reset:")
             for i in range(torch.cuda.device_count()):
                 print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-        
-        # Print GPU information 
-        for i in range(torch.cuda.device_count()):
-            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
             
         # When using DataParallel, the primary device is the first one
         torch.cuda.set_device(0)
         
         # Initial memory status
         print("Initial GPU memory status:")
-        manage_gpu_memory()
+        if has_gpu_utils:
+            print_pytorch_gpu_memory()
+        else:
+            manage_gpu_memory()
     
     # ==== Example for inferring a single image ===
     ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'

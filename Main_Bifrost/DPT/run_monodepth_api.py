@@ -11,6 +11,7 @@ import util.io
 import os
 import glob
 import torch
+import torch.nn as nn
 import cv2
 import argparse
 import time
@@ -27,163 +28,81 @@ os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # from util.misc import visualize_attention
 
 
-def run(model, transform, input_path, output_path, model_type="dpt_large", optimize=True):
-    """Run MonoDepthNN to compute depth maps.
-
-    Args:
-        input_path (str): path to input folder
-        output_path (str): path to output folder
-        model_path (str): path to saved model
-    """
-
-    # select device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    '''
-    # load network
-    if model_type == "dpt_large":  # DPT-Large
-        net_w = net_h = 384
-        model = DPTDepthModel(
-            path=model_path,
-            backbone="vitl16_384",
-            non_negative=True,
-            enable_attention_hooks=False,
-        )
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    elif model_type == "dpt_hybrid":  # DPT-Hybrid
-        net_w = net_h = 384
-        model = DPTDepthModel(
-            path=model_path,
-            backbone="vitb_rn50_384",
-            non_negative=True,
-            enable_attention_hooks=False,
-        )
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    elif model_type == "dpt_hybrid_kitti":
-        net_w = 1216
-        net_h = 352
-
-        model = DPTDepthModel(
-            path=model_path,
-            scale=0.00006016,
-            shift=0.00579,
-            invert=True,
-            backbone="vitb_rn50_384",
-            non_negative=True,
-            enable_attention_hooks=False,
-        )
-
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    elif model_type == "dpt_hybrid_nyu":
-        net_w = 640
-        net_h = 480
-
-        model = DPTDepthModel(
-            path=model_path,
-            scale=0.000305,
-            shift=0.1378,
-            invert=True,
-            backbone="vitb_rn50_384",
-            non_negative=True,
-            enable_attention_hooks=False,
-        )
-
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    elif model_type == "midas_v21":  # Convolutional model
-        net_w = net_h = 384
-
-        model = MidasNet_large(model_path, non_negative=True)
-        normalization = NormalizeImage(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        )
+def run(model, transform, input_path, output_path, model_type="dpt_large"):
+    """Run the DPT model on all images in a directory."""
+    # Get device from model (handles both normal and DataParallel models)
+    if isinstance(model, nn.DataParallel):
+        device = next(model.module.parameters()).device
     else:
-        assert (
-            False
-        ), f"model_type '{model_type}' not implemented, use: --model_type [dpt_large|dpt_hybrid|dpt_hybrid_kitti|dpt_hybrid_nyu|midas_v21]"
+        device = next(model.parameters()).device
+    
+    print(f"Running DPT on device: {device}")
+    
+    # Get all images in the directory
+    if os.path.isdir(input_path):
+        img_names = glob.glob(os.path.join(input_path, "*.jpg"))
+        img_names += glob.glob(os.path.join(input_path, "*.jpeg"))
+        img_names += glob.glob(os.path.join(input_path, "*.png"))
+    else:
+        img_names = [input_path]
 
-    transform = Compose(
-        [
-            Resize(
-                net_w,
-                net_h,
-                resize_target=None,
-                keep_aspect_ratio=True,
-                ensure_multiple_of=32,
-                resize_method="minimal",
-                image_interpolation_method=cv2.INTER_CUBIC,
-            ),
-            normalization,
-            PrepareForNet(),
-        ]
-    )
-
-    model.eval()
-
-    if optimize == True and device == torch.device("cuda"):
-        model = model.to(memory_format=torch.channels_last)
-        model = model.half()
-
-    model.to(device)
-'''
-    # get input
-    img_names = glob.glob(os.path.join(input_path, "*"))
-    num_images = len(img_names)
-
-    # create output folder
     os.makedirs(output_path, exist_ok=True)
 
     for ind, img_name in enumerate(img_names):
-        if os.path.isdir(img_name):
+        img = cv2.imread(img_name)
+        if img is None:
+            print(f"Error: Unable to load image {img_name}")
             continue
+            
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0
 
-        img = util.io.read_image(img_name)
+        if img.ndim == 2:
+            img = img[:, :, np.newaxis]
+            img = np.repeat(img, 3, axis=2)
 
+        # Prepare image for model input
         img_input = transform({"image": img})["image"]
-
-        # compute
-        with torch.no_grad():
-            sample = torch.from_numpy(img_input).to(device).unsqueeze(0)
-
-            if optimize == True and device == torch.device("cuda"):
-                sample = sample.to(memory_format=torch.channels_last)
-                sample = sample.half()
-
-            prediction = model.forward(sample)
-            prediction = (
-                torch.nn.functional.interpolate(
-                    prediction.unsqueeze(1),
-                    size=img.shape[:2],
-                    mode="bicubic",
-                    align_corners=False,
-                )
-                .squeeze()
-                .cpu()
-                .numpy()
-            )
-
-            if model_type == "dpt_hybrid_kitti":
-                prediction *= 256
-
-            if model_type == "dpt_hybrid_nyu":
-                prediction *= 1000.0
-
-        filename = os.path.join(
-            output_path, os.path.splitext(os.path.basename(img_name))[0]
-        )
-        util.io.write_depth(filename, prediction, bits=2,
-                            absolute_depth=False)
+        img_input = torch.from_numpy(img_input).unsqueeze(0).to(device)
         
+        # Perform inference with memory optimization
+        with torch.no_grad():
+            prediction = model.forward(img_input)
+            prediction = torch.nn.functional.interpolate(
+                prediction.unsqueeze(1),
+                size=img.shape[:2],
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze()
+        
+        prediction = prediction.cpu().numpy()
+        
+        # Save output
+        output_name = os.path.join(
+            output_path, os.path.splitext(os.path.basename(img_name))[0] + ".png"
+        )
+        cv2.imwrite(output_name, prediction)
 
-def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True):
-    """Initialize the DPT model with multi-GPU support."""
+    print(f"Finished processing {len(img_names)} images. Results saved in {output_path}")
+    
+    # Clean up GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True, custom_data_parallel=None):
+    """Initialize the DPT model with multi-GPU support.
+    
+    Args:
+        model_path: Path to the model weights
+        model_type: Type of DPT model to load
+        optimize: Whether to optimize memory usage
+        custom_data_parallel: Custom DataParallel class to use (if None, uses standard DataParallel)
+    """
     # select device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device: %s" % device)
     
-    # Load model with multi-GPU support if available
+    # Load model
     if model_type == "dpt_large":  # DPT-Large
         model = DPTDepthModel(
             path=model_path,
@@ -201,14 +120,19 @@ def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True):
         # use PyTorch to perform memory optimizations
         model.to(memory_format=torch.channels_last)
     
+    # Move model to GPU
+    model = model.to(device)
+    model.eval()
+    
     # Check if multiple GPUs are available and use DataParallel if so
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for DPT model")
-        model = torch.nn.DataParallel(model)
+        # Use custom DataParallel class if provided
+        if custom_data_parallel is not None:
+            model = custom_data_parallel(model)
+        else:
+            model = torch.nn.DataParallel(model)
     
-    model.to(device)
-    model.eval()
-
     # load transforms
     transform = Compose(
         [
@@ -282,11 +206,15 @@ if __name__ == "__main__":
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
 
+    # Initialize model
+    model, transform = initialize_dpt_model(
+        args.model_weights, args.model_type, args.optimize)
+
     # compute depth maps
     run(
+        model,
+        transform,
         args.input_path,
         args.output_path,
-        args.model_weights,
         args.model_type,
-        args.optimize,
     )
