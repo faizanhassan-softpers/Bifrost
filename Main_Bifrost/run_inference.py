@@ -10,10 +10,10 @@ import time
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 # sys.path.insert(0, '/home/ec2-user/SageMaker/Codes/ControlNet')
 
-print("GPU allocation:")
-print("- ControlNet model: GPU 0")
-print("- SAM model: GPU 1")
-print("- DPT Depth model: GPU 2") 
+print("GPU allocation (redistributed based on memory usage):")
+print("- DPT Depth model: GPU 0 (was GPU 2)")
+print("- ControlNet model: GPU 1 (was GPU 0)")
+print("- SAM model: GPU 2 (was GPU 1)") 
 print("- LLaVA model: GPU 3")
 
 from pytorch_lightning import seed_everything
@@ -33,17 +33,17 @@ from DPT.run_monodepth_api import run, initialize_dpt_model
 from segment_anything import SamPredictor, sam_model_registry
 import matplotlib.pyplot as plt
 
-# Assign models to different GPUs
-controlnet_device = "cuda:0"
-sam_device = "cuda:1"
-dpt_device = "cuda:2"
+# Assign models to different GPUs - rebalanced based on memory usage
+controlnet_device = "cuda:1"  # Move from GPU 0 to GPU 1
+sam_device = "cuda:2"         # Move from GPU 1 to GPU 2
+dpt_device = "cuda:0"         # Move from GPU 2 to GPU 0
 
-# Load SAM on GPU 1
+# Load SAM on GPU 2
 sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
 sam = sam.to(sam_device)
 predictor = SamPredictor(sam)
 
-# Load DPT model on GPU 2
+# Load DPT model on GPU 0
 dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt', device=dpt_device)
 
 
@@ -57,7 +57,7 @@ config = OmegaConf.load('./configs/inference.yaml')
 model_ckpt =  config.pretrained_model
 model_config = config.config_file
 
-# Load ControlNet model on GPU 0
+# Load ControlNet model on GPU 1
 model = create_model(model_config).cpu()
 model.load_state_dict(load_state_dict(model_ckpt, location=controlnet_device))
 model = model.to(controlnet_device)
