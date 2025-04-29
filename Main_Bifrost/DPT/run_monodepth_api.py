@@ -13,6 +13,11 @@ import glob
 import torch
 import cv2
 import argparse
+import time
+import numpy as np
+from PIL import Image
+import torchvision.transforms as transforms
+from DPT.util.misc import visualize_attention
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -171,50 +176,55 @@ def run(model, transform, input_path, output_path, model_type="dpt_large", optim
                             absolute_depth=False)
         
 
-def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True, use_multiple_gpus=True):
+def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True):
+    """Initialize the DPT model with multi-GPU support."""
+    # select device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device: %s" % device)
+    
+    # Load model with multi-GPU support if available
     if model_type == "dpt_large":  # DPT-Large
-        net_w = net_h = 384
         model = DPTDepthModel(
             path=model_path,
             backbone="vitl16_384",
             non_negative=True,
-            enable_attention_hooks=False,
         )
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        transform = Compose(
-            [
-                Resize(
-                    net_w,
-                    net_h,
-                    resize_target=None,
-                    keep_aspect_ratio=True,
-                    ensure_multiple_of=32,
-                    resize_method="minimal",
-                    image_interpolation_method=cv2.INTER_CUBIC,
-                ),
-                normalization,
-                PrepareForNet(),
-            ]
-        )
+        net_w, net_h = 384, 384
+        resize_mode = "minimal"
+        normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    else:
+        print(f"Model {model_type} not implemented, please choose one of the other models.")
+        return None, None
 
-    model.eval()
-
-    if optimize == True and device == torch.device("cuda"):
-        model = model.to(memory_format=torch.channels_last)
-        model = model.half()
-
-    # Handle multiple GPUs if requested
-    if use_multiple_gpus and torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
-        # Option 1: DataParallel (simpler but less efficient)
+    if optimize:
+        # use PyTorch to perform memory optimizations
+        model.to(memory_format=torch.channels_last)
+    
+    # Check if multiple GPUs are available and use DataParallel if so
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for DPT model")
         model = torch.nn.DataParallel(model)
-        # Option 2: DistributedDataParallel (more efficient but requires more setup)
-        # This would require additional code for distributed training setup
-        # model = torch.nn.parallel.DistributedDataParallel(model)
     
     model.to(device)
+    model.eval()
+
+    # load transforms
+    transform = Compose(
+        [
+            Resize(
+                net_w,
+                net_h,
+                resize_target=None,
+                keep_aspect_ratio=True,
+                ensure_multiple_of=32,
+                resize_method=resize_mode,
+                image_interpolation_method=cv2.INTER_CUBIC,
+            ),
+            normalization,
+            PrepareForNet(),
+        ]
+    )
+
     return model, transform
 
 

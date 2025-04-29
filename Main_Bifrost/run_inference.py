@@ -7,7 +7,7 @@ import os
 import sys
 import time
 # Set CUDA_VISIBLE_DEVICES to use specific GPUs
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 # sys.path.insert(0, '/home/ec2-user/SageMaker/Codes/ControlNet')
 
 from pytorch_lightning import seed_everything
@@ -29,33 +29,51 @@ import matplotlib.pyplot as plt
 import torch.nn as nn
 import torch.distributed as dist
 
-sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
-predictor = SamPredictor(sam)
-dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
+# Initialize GPU settings
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"Number of GPUs: {torch.cuda.device_count()}")
+for i in range(torch.cuda.device_count()):
+    print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
 
+# Initialize models with GPU settings
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Loading SAM model on device: {device}")
+sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
+sam = sam.to(device)
+
+# Use DataParallel for SAM model if multiple GPUs are available
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs for SAM model")
+    sam = nn.DataParallel(sam)
+
+predictor = SamPredictor(sam)
+
+print(f"Loading DPT model...")
+dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
+dpt_model = dpt_model.to(device)
 
 save_memory = False
 disable_verbosity()
 if save_memory:
     enable_sliced_attention()
 
-
 config = OmegaConf.load('./configs/inference.yaml')
-model_ckpt =  config.pretrained_model
+model_ckpt = config.pretrained_model
 model_config = config.config_file
 
-# Create model and load state dict
+# Create model on CPU first
 model = create_model(model_config).cpu()
 state_dict = load_state_dict(model_ckpt, location='cuda')
 
 # Check if multiple GPUs are available
 if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs!")
+    print(f"Using {torch.cuda.device_count()} GPUs for inference!")
     
-    # Use DataParallel for multi-GPU support
+    # Move model to CUDA before wrapping with DataParallel
     model.load_state_dict(state_dict)
-    model = nn.DataParallel(model)
     model = model.cuda()
+    # Use DataParallel to distribute model across all available GPUs
+    model = nn.DataParallel(model)
 else:
     # Single GPU case
     model.load_state_dict(state_dict)
@@ -86,6 +104,7 @@ def aug_tar_mask(mask, kernal_size=0.001):
     return aug_mask
 
 def process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold):
+    """Process image pairs for inference. Optimized for multi-GPU processing."""
     # ========= Reference ===========
     # ref expand 
     ref_box_yyxx = get_bbox_from_mask(ref_mask)
@@ -97,7 +116,6 @@ def process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_d
     y1,y2,x1,x2 = ref_box_yyxx
     masked_ref_image = masked_ref_image[y1:y2,x1:x2,:]
     ref_mask = ref_mask[y1:y2,x1:x2]
-
 
     ratio = np.random.randint(12, 13) / 10
     masked_ref_image, ref_mask = expand_image_mask(masked_ref_image, ref_mask, ratio=ratio)
@@ -121,23 +139,12 @@ def process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_d
     # masked_ref_image = aug_data(masked_ref_image) 
 
     # collage aug 
-    masked_ref_image_compose, ref_mask_compose = masked_ref_image, ref_mask #aug_data_mask(masked_ref_image, ref_mask) 
+    masked_ref_image_compose, ref_mask_compose = masked_ref_image, ref_mask 
     masked_ref_image_aug = masked_ref_image_compose.copy()
     ref_mask_3 = np.stack([ref_mask_compose,ref_mask_compose,ref_mask_compose],-1)
-    '''
-    occluded_mask_resized = cv2.resize(occluded_mask.astype(np.uint8), (masked_ref_image_compose.shape[1], masked_ref_image_compose.shape[0]))
-    for i in range(masked_ref_image_compose.shape[0]):
-        for j in range(masked_ref_image_compose.shape[1]):
-            if occluded_mask_resized[i,j] == 0:
-                masked_ref_image_compose[i, j] = 0.0
-                '''  
-    # ref_box_yyxx = get_bbox_from_mask(ref_mask_compose)
-    # y1,y2,x1,x2 = ref_box_yyxx
-    # masked_ref_image_compose = masked_ref_image_compose[y1:y2,x1:x2,:]
-    # ref_mask_compose = ref_mask_compose[y1:y2,x1:x2]
+ 
     ref_image_collage = sobel(masked_ref_image_compose, ref_mask_compose/255, color=sobel_color, thresh=sobel_threshold)
     
-
     # ========= Target ===========
     tar_box_yyxx = get_bbox_from_mask(tar_mask)
     tar_box_yyxx = expand_bbox(tar_mask, tar_box_yyxx, ratio=[1.1,1.2])
@@ -202,7 +209,7 @@ def process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_d
     masked_ref_image_aug = masked_ref_image_aug  / 255 
     cropped_target_image = cropped_target_image / 127.5 - 1.0
     collage = collage / 127.5 - 1.0 
-    collage = np.concatenate([collage, collage_mask[:,:,:1]  ] , -1)
+    collage = np.concatenate([collage, collage_mask[:,:,:1]], -1)
     tar_depth = tar_depth / 255
 
     item = dict(ref=masked_ref_image_aug.copy(), 
@@ -210,7 +217,7 @@ def process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_d
                 hint=collage.copy(), 
                 depth=tar_depth.copy(), 
                 extra_sizes=np.array([H1, W1, H2, W2]), 
-                tar_box_yyxx_crop=np.array( tar_box_yyxx_crop ) ) 
+                tar_box_yyxx_crop=np.array(tar_box_yyxx_crop)) 
     return item
 
 
@@ -238,8 +245,30 @@ def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
     return gen_image
 
 
+# Add a function to manage GPU memory
+def manage_gpu_memory():
+    """Clean up GPU memory and report usage statistics."""
+    if torch.cuda.is_available():
+        # Report memory usage
+        for i in range(torch.cuda.device_count()):
+            print(f"GPU {i} memory allocated: {torch.cuda.memory_allocated(i) / 1024**2:.2f} MB")
+            print(f"GPU {i} memory cached: {torch.cuda.memory_reserved(i) / 1024**2:.2f} MB")
+        
+        # Empty cache to free up memory
+        torch.cuda.empty_cache()
+        print("GPU cache cleared")
+
+# Update inference_single_image function to include memory management
 def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num=10, sobel_color=False, sobel_threshold=20, guidance_scale = 5.0):
+    # Starting memory check
+    if torch.cuda.is_available():
+        print("Memory status at start of inference:")
+        manage_gpu_memory()
+        
+    # Process the image pairs
     item = process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold)
+    
+    # Prepare visualization
     ref = item['ref'] * 255
     tar = item['jpg'] * 127.5 + 127.5
     hint = item['hint'] * 127.5 + 127.5
@@ -261,7 +290,12 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     hint = item['hint']
     depth = item['depth']
     
-    # Move tensors to GPU and handle batching for multiple GPUs
+    # Check memory before moving tensors to GPU
+    if torch.cuda.is_available():
+        print("Memory status before loading tensors to GPU:")
+        manage_gpu_memory()
+    
+    # Move tensors to GPU - replicate for all GPUs if using DataParallel
     control_detail = torch.from_numpy(hint.copy()).float().cuda() 
     control_detail = torch.stack([control_detail for _ in range(num_samples)], dim=0)
     control_detail = einops.rearrange(control_detail, 'b h w c -> b c h w').clone()
@@ -275,19 +309,38 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     clip_input = einops.rearrange(clip_input, 'b h w c -> b c h w').clone()
 
     guess_mode = False
-    H,W = 512,512
+    H, W = 512, 512
 
-    # Handle model conditioning for multiple GPUs
+    # Get the actual model for conditioning
     actual_model = get_actual_model(model)
-    cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [actual_model.get_learned_conditioning(clip_input)]}
-    un_cond = {"c_concat_detail": None if guess_mode else [control_detail], "c_concat_depth": None if guess_mode else [control_depth], "c_crossattn": [actual_model.get_learned_conditioning([torch.zeros((1,3,224,224))] * num_samples)]}
+    
+    # Check memory after tensor preparation
+    if torch.cuda.is_available():
+        print("Memory status after tensor preparation:")
+        manage_gpu_memory()
+    
+    # Prepare conditions for the model
+    learned_conditioning = actual_model.get_learned_conditioning(clip_input)
+    
+    # Set up conditional and unconditional inputs
+    cond = {
+        "c_concat_detail": [control_detail], 
+        "c_concat_depth": [control_depth], 
+        "c_crossattn": [learned_conditioning]
+    }
+    
+    un_cond = {
+        "c_concat_detail": None if guess_mode else [control_detail], 
+        "c_concat_depth": None if guess_mode else [control_depth], 
+        "c_crossattn": [actual_model.get_learned_conditioning([torch.zeros((1,3,224,224), device=clip_input.device)] * num_samples)]
+    }
 
     shape = (4, H // 8, W // 8)
 
     if save_memory:
         call_model_method(model, "low_vram_shift", is_diffusing=True)
 
-    # ====
+    # Sampling parameters
     num_samples = 1
     image_resolution = 512
     strength = 1
@@ -297,18 +350,36 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     seed = -1
     eta = 0.0
 
-    # Set control scales
+    # Set control scales with the actual model
     actual_model = get_actual_model(model)
     actual_model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
 
-    samples, intermediates = ddim_sampler.sample(ddim_steps, num_samples,
-                                                shape, cond, verbose=False, eta=eta,
-                                                unconditional_guidance_scale=scale,
-                                                unconditional_conditioning=un_cond)
+    # Check memory before sampling
+    if torch.cuda.is_available():
+        print("Memory status before sampling:")
+        manage_gpu_memory()
+    
+    # Sample with DataParallel model
+    samples, intermediates = ddim_sampler.sample(
+        ddim_steps, 
+        num_samples,
+        shape, 
+        cond, 
+        verbose=False, 
+        eta=eta,
+        unconditional_guidance_scale=scale,
+        unconditional_conditioning=un_cond
+    )
+    
     if save_memory:
         call_model_method(model, "low_vram_shift", is_diffusing=False)
 
-    # Decode samples
+    # Check memory after sampling
+    if torch.cuda.is_available():
+        print("Memory status after sampling:")
+        manage_gpu_memory()
+    
+    # Decode samples with the actual model
     actual_model = get_actual_model(model)
     x_samples = actual_model.decode_first_stage(samples)
     x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
@@ -321,6 +392,12 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     sizes = item['extra_sizes']
     tar_box_yyxx_crop = item['tar_box_yyxx_crop'] 
     gen_image = crop_back(pred, tar_image, sizes, tar_box_yyxx_crop) 
+    
+    # Final memory cleanup
+    if torch.cuda.is_available():
+        print("Final memory cleanup:")
+        manage_gpu_memory()
+        
     return gen_image
 
 
@@ -379,6 +456,21 @@ def depth_mask_fusion(back_depth, ref_depth, back_mask, ref_mask, depth_scale=[0
 
 
 if __name__ == '__main__': 
+    # Set the CUDA device
+    if torch.cuda.is_available():
+        print(f"Using {torch.cuda.device_count()} GPUs for inference")
+        
+        # Print GPU information 
+        for i in range(torch.cuda.device_count()):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+            
+        # When using DataParallel, the primary device is the first one
+        torch.cuda.set_device(0)
+        
+        # Initial memory status
+        print("Initial GPU memory status:")
+        manage_gpu_memory()
+
     # ==== Example for inferring a single image ===
     ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'
     ref_image_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/object_mask.jpg'
@@ -408,19 +500,7 @@ if __name__ == '__main__':
     sobel_threshold = 50
     start_time = time.time()
 
-    # using zero123 to generate new image with novel view
-    # given_image = cv2.imread(opt.input_image, cv2.IMREAD_UNCHANGED)
-    # given_image = cv2.cvtColor(given_image.copy(), cv2.COLOR_BGR2RGB)
-    # run_demo(opts=opt)
-
-    # reference image + reference mask
-    # You could use the demo of SAM to extract RGB-A image with masks
-    # https://segment-anything.com/demo
-
-    if bg_mask[0]+bg_mask[2] > 1 or bg_mask[1]+bg_mask[3] > 1:
-        print('The mask is out of range')
-        exit()
-
+    print("Loading reference and background images...")
     # reference image
     image = cv2.imread(ref_image_path, cv2.IMREAD_UNCHANGED)
     image = cv2.cvtColor(image.copy(), cv2.COLOR_BGR2RGB)
@@ -429,30 +509,23 @@ if __name__ == '__main__':
 
     h, w = image.shape[0], image.shape[1]
 
-
-
     # background image
     back_image = cv2.imread(bg_image_path).astype(np.uint8)
     back_image = cv2.cvtColor(back_image, cv2.COLOR_BGR2RGB)
-    '''
-    image_gry = cv2.imread(ref_image_path, cv2.IMREAD_GRAYSCALE)
 
-    # mask = (image[:,:,-1] > 128).astype(np.uint8)
-    mask = (image_gry[:, :] < 253).astype(np.uint8)
-    # image = image[:,:,:-1]
-    image = cv2.cvtColor(image.copy(), cv2.COLOR_BGR2RGB)
-    h, w = image.shape[0], image.shape[1]
-    ref_image = image*mask[:, :, None]
-    ref_image = image 
-    ref_mask = mask
-    '''
+    # Memory check after loading images
+    if torch.cuda.is_available():
+        print("Memory status after loading images:")
+        manage_gpu_memory()
+
+    print("Using SAM to predict the mask for reference image...")
     # Use SAM to predict the mask for reference image
     predictor.set_image(image)
     point_coords = np.array([[h*ref_object_location[1], w*ref_object_location[0]]])
     point_labels = np.array([1])
     masks, _, _ = predictor.predict(point_coords=point_coords,
-                                    point_labels=point_labels,
-                                    multimask_output=True)
+                                point_labels=point_labels,
+                                multimask_output=True)
     # save the mask image
     mask = masks[1].astype(np.uint8)
     # cv2.imwrite(ref_image_mask_path, mask)
@@ -466,30 +539,34 @@ if __name__ == '__main__':
         point_coords = np.array([[w_back*bg_object_location[0], h_back*bg_object_location[1]]])
         point_labels = np.array([1])
         masks, _, _ = predictor.predict(point_coords=point_coords,
-                                        point_labels=point_labels,
-                                        multimask_output=True)
+                                    point_labels=point_labels,
+                                    multimask_output=True)
         # save the mask image
         back_mask = masks[1].astype(np.uint8)
         # cv2.imwrite(bg_mask_path, back_mask)
 
+    # Memory check after mask prediction
+    if torch.cuda.is_available():
+        print("Memory status after mask prediction:")
+        manage_gpu_memory()
+
+    print("Getting depth maps using DPT...")
     # Get the depth map using DPT
     run(dpt_model, transform, input_folder, output_folder)
 
-
-    # transform reference image style to the background image style
-    # aug = A.Compose([A.FDA([back_image], p=1, read_fn=lambda x: x)])
-    # transfered_ref_image = aug(image=image)['image']
-    # ref_image = transfered_ref_image
-
+    # Memory check after depth prediction
+    if torch.cuda.is_available():
+        print("Memory status after depth prediction:")
+        manage_gpu_memory()
 
     tar_mask = np.zeros(back_image.shape[:2], np.uint8)
     tar_mask[int((bg_mask[1])*back_image.shape[0]):int((bg_mask[1]+bg_mask[3])*back_image.shape[0]),
-                int((bg_mask[0])*back_image.shape[1]):int((bg_mask[0]+bg_mask[2])*back_image.shape[1])] = 1
+            int((bg_mask[0])*back_image.shape[1]):int((bg_mask[0]+bg_mask[2])*back_image.shape[1])] = 1
 
-
+    print("Processing depth maps...")
     # read the depth map predicted by DPT
-    back_depth = cv2.imread('/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth/background.png', cv2.IMREAD_UNCHANGED)
-    ref_depth = cv2.imread('/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth/object.png', cv2.IMREAD_UNCHANGED)
+    back_depth = cv2.imread('/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/background.png', cv2.IMREAD_UNCHANGED)
+    ref_depth = cv2.imread('/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/object.png', cv2.IMREAD_UNCHANGED)
     ref_depth = ref_depth*ref_mask
     if flip_image:
         ref_depth = cv2.flip(ref_depth, 1)
@@ -502,6 +579,7 @@ if __name__ == '__main__':
     ref_depth = ref_depth[y1:y2,x1:x2]
     cropped_ref_mask = ref_mask[y1:y2,x1:x2]
 
+    print("Fusing depth and mask...")
     # fuse the depth and mask
     fused_depth, fused_mask, occluded_mask = depth_mask_fusion(back_depth, ref_depth, bg_mask, cropped_ref_mask, depth, mode=mode)
     fused_mask = fused_mask*255
@@ -515,89 +593,43 @@ if __name__ == '__main__':
     elif mode == 'draw':
         tar_mask = cv2.imread(bg_mask_path, cv2.IMREAD_UNCHANGED)
         tar_mask = (tar_mask[:, :] > 0).astype(np.uint8)
-    # tar_mask = tar_mask < 128
-    # tar_mask = tar_mask.astype(np.uint8)
+    
     if flip_image:
         ref_mask = cv2.flip(ref_mask, 1)
 
     tar_depth = cv2.imread(fused_depth_path, cv2.IMREAD_UNCHANGED)
+    
+    # Memory check before inference
+    if torch.cuda.is_available():
+        print("Memory status before running main inference:")
+        manage_gpu_memory()
+    
+    print("Running main inference...")
+    # Run inference using the model distributed across multiple GPUs
     gen_image = inference_single_image(ref_image, ref_mask, back_image.copy(), tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold)
-    # print("gen_image: ", gen_image.shape)
+    
+    # Memory check after inference
+    if torch.cuda.is_available():
+        print("Memory status after inference:")
+        manage_gpu_memory()
+    
+    print("Saving results...")
     h,w = back_image.shape[0], back_image.shape[0]
     ref_image = cv2.resize(ref_image, (w,h))
     tar_depth = cv2.resize(tar_depth, (w,h))
-    # given_image = cv2.resize(given_image, (w,h))
     vis_image = cv2.hconcat([ref_image, back_image, gen_image])
 
     cv2.imwrite(save_compose_path, vis_image[:,:,::-1])
     cv2.imwrite(save_path, gen_image[:,:,::-1])
     end_time = time.time()
-    print("Time: ", end_time-start_time)
-
-    '''
-    # ==== Example for inferring VITON-HD Test dataset ===
-
-    from omegaconf import OmegaConf
-    import os 
-    DConf = OmegaConf.load('./configs/datasets.yaml')
-    save_dir = '/home/mhf/dxl/Lingxiao/Codes/dreambooth/dreambooth_output_anydoor'
-    flag = False
-    if not os.path.exists(save_dir):
-        os.mkdir(save_dir)
-
-    test_dir = DConf.Test.VitonHDTest.image_dir
-    image_names = os.listdir(test_dir)
-    object_dir = '/home/mhf/dxl/Lingxiao/Codes/dreambooth/dreambooth_object'
-    bg_dir = '/home/mhf/dxl/Lingxiao/Codes/dreambooth/bg_test'
-    # output_dir = '/mnt/workspace/gongkaixiong/lingxiaoli/Codes/dreambooth/dreambooth_output_anydoor'
-    image_names = os.listdir(object_dir)
-    for image_name in image_names:
-        if image_name.endswith('.jpg'):
-            ref_image_path = os.path.join(object_dir, image_name)
-            print("ref_image_path: ", ref_image_path)
-            background_names = os.listdir(bg_dir)
-            for background_name in tqdm(background_names):
-                if not background_name.endswith("mask.jpg"):
-                    print("background_name: ", background_name)
-                    background_path = os.path.join(bg_dir, background_name)
-                    count = background_name.split('_')[-1].split('.')[0]
-                    # background = cv2.imread(background_path, cv2.IMREAD_UNCHANGED)
-                    # background = cv2.cvtColor(background, cv2.COLOR_BGR2RGB)
-                    # end_string = background_name.split('.')[0].split('_')[-1]
-                    # backgroun_mask = cv2.imread(background_path.replace('.jpg', '_mask.jpg'), cv2.IMREAD_UNCHANGED)
-                    
-                    # ref_image_path = os.path.join(test_dir, image_name)
-                    tar_image_path = background_path
-                    ref_mask_path = ref_image_path.replace('/dreambooth_object/','/object_mask/')
-                    tar_mask_path = tar_image_path.replace('.jpg', '_mask.jpg')
-
-                    ref_image = cv2.imread(ref_image_path)
-                    ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
-
-                    gt_image = cv2.imread(tar_image_path)
-                    gt_image = cv2.cvtColor(gt_image, cv2.COLOR_BGR2RGB)
-
-                    ref_mask = (cv2.imread(ref_mask_path) > 0).astype(np.uint8)[:,:,0]
-
-                    tar_mask = Image.open(tar_mask_path ).convert('P')
-                    tar_mask= np.array(tar_mask)
-                    tar_mask = (tar_mask < 1).astype(np.uint8)
-
-                    gen_image = inference_single_image(ref_image, ref_mask, gt_image.copy(), tar_mask)
-                    dir_name = image_name.split('.')[0]
-                    if not os.path.exists(os.path.join(save_dir, dir_name)):
-                        os.mkdir(os.path.join(save_dir, dir_name))
-                    gen_path = os.path.join(save_dir, dir_name, str(count)+'.jpg')
-                    # vis_image = cv2.hconcat([ref_image, gt_image, gen_image])
-                    gen_image = cv2.cvtColor(gen_image, cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(gen_path, gen_image)
-                    # count += 1
-                    flag = True
-                # if flag:
-                #     break
-            # if flag:
-            #     break    
-    '''
+    print("Total time: ", end_time-start_time)
+    
+    # Final memory cleanup
+    if torch.cuda.is_available():
+        print("Final memory cleanup:")
+        manage_gpu_memory()
+        
+    print("Inference completed successfully!")
 
     
 
