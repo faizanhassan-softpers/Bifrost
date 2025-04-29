@@ -171,7 +171,7 @@ def run(model, transform, input_path, output_path, model_type="dpt_large", optim
                             absolute_depth=False)
         
 
-def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True):
+def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True, use_multiple_gpus=True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if model_type == "dpt_large":  # DPT-Large
         net_w = net_h = 384
@@ -205,6 +205,15 @@ def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True):
         model = model.to(memory_format=torch.channels_last)
         model = model.half()
 
+    # Handle multiple GPUs if requested
+    if use_multiple_gpus and torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        # Option 1: DataParallel (simpler but less efficient)
+        model = torch.nn.DataParallel(model)
+        # Option 2: DistributedDataParallel (more efficient but requires more setup)
+        # This would require additional code for distributed training setup
+        # model = torch.nn.parallel.DistributedDataParallel(model)
+    
     model.to(device)
     return model, transform
 
