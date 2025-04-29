@@ -42,6 +42,49 @@ from DPT.run_monodepth_api import run, initialize_dpt_model
 from segment_anything import SamPredictor, sam_model_registry
 import torch.nn as nn
 
+# Custom SamPredictor for half precision
+class HalfPrecisionSamPredictor(SamPredictor):
+    """
+    Modified SamPredictor that ensures all inputs are in half precision
+    """
+    def predict(self, *args, **kwargs):
+        # Convert point_coords and point_labels to half precision if they exist
+        if 'point_coords' in kwargs and kwargs['point_coords'] is not None:
+            kwargs['point_coords'] = torch.tensor(kwargs['point_coords'], 
+                                                device=self.device,
+                                                dtype=torch.float16)
+        if 'point_labels' in kwargs and kwargs['point_labels'] is not None:
+            kwargs['point_labels'] = torch.tensor(kwargs['point_labels'], 
+                                                device=self.device,
+                                                dtype=torch.float16)
+        return super().predict(*args, **kwargs)
+        
+    def predict_torch(self, *args, **kwargs):
+        # Convert inputs to half precision
+        for key in kwargs:
+            if isinstance(kwargs[key], torch.Tensor) and kwargs[key].dtype == torch.float32:
+                kwargs[key] = kwargs[key].half()
+        return super().predict_torch(*args, **kwargs)
+        
+    def set_image(self, image, image_format="RGB"):
+        """Sets a new image for the predictor."""
+        # Process the image normally
+        result = super().set_image(image, image_format)
+        
+        # Convert features to half precision
+        if hasattr(self, 'features') and self.features is not None:
+            self.features = self.features.half()
+            
+        if hasattr(self, 'original_size') and self.original_size is not None:
+            if isinstance(self.original_size, torch.Tensor) and self.original_size.dtype == torch.float32:
+                self.original_size = self.original_size.half()
+                
+        if hasattr(self, 'input_size') and self.input_size is not None:
+            if isinstance(self.input_size, torch.Tensor) and self.input_size.dtype == torch.float32:
+                self.input_size = self.input_size.half()
+                
+        return result
+
 # Create a DataParallel wrapper that preserves attribute access
 class DataParallelWithAttributes(nn.DataParallel):
     """DataParallel wrapper that allows accessing model attributes even after wrapping."""
@@ -77,8 +120,10 @@ def load_models_fp16():
             checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth"
         )
         sam = sam.to(sam_device).half()  # Convert to half precision
-        predictor = SamPredictor(sam)
-        print("SAM model loaded in half precision")
+        
+        # Use our custom half precision-aware predictor
+        predictor = HalfPrecisionSamPredictor(sam)
+        print("SAM model loaded in half precision with custom HalfPrecisionSamPredictor")
         
     except Exception as e:
         print(f"Error loading SAM: {e}")

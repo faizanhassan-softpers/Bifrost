@@ -9,6 +9,10 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 # Set optimization options
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
+# Fix for tensor type mismatch errors (important for half precision)
+export PYTORCH_JIT=0
+export TORCH_USE_RTLD_GLOBAL=1
+
 # Print configuration
 echo "Using GPUs: $CUDA_VISIBLE_DEVICES"
 echo "PyTorch memory configuration: $PYTORCH_CUDA_ALLOC_CONF"
