@@ -6,7 +6,8 @@ import random
 import os
 import sys
 import time
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+# Set CUDA_VISIBLE_DEVICES to use specific GPUs
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 # sys.path.insert(0, '/home/ec2-user/SageMaker/Codes/ControlNet')
 
 from pytorch_lightning import seed_everything
@@ -26,6 +27,9 @@ from DPT.run_monodepth_api import run, initialize_dpt_model
 from segment_anything import SamPredictor, sam_model_registry
 import matplotlib.pyplot as plt
 import torch.nn as nn
+import torch.distributed as dist
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+
 sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
 predictor = SamPredictor(sam)
 dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
@@ -41,15 +45,53 @@ config = OmegaConf.load('./configs/inference.yaml')
 model_ckpt =  config.pretrained_model
 model_config = config.config_file
 
+# Create model and load state dict
 model = create_model(model_config).cpu()
-model.load_state_dict(load_state_dict(model_ckpt, location='cuda'))
+state_dict = load_state_dict(model_ckpt, location='cuda')
+
+# Check if multiple GPUs are available
 if torch.cuda.device_count() > 1:
     print(f"Using {torch.cuda.device_count()} GPUs!")
-    model = nn.DataParallel(model)
-model = model.cuda()
+    
+    # Option 1: Use DataParallel (simpler but less efficient)
+    # model = nn.DataParallel(model)
+    # model.load_state_dict(state_dict)
+    # model = model.cuda()
+    
+    # Option 2: Use device_map="auto" for better efficiency (similar to LLaVA)
+    # First load the model to CPU
+    model.load_state_dict(state_dict)
+    
+    # Then use accelerate to distribute the model across GPUs
+    with init_empty_weights():
+        model = create_model(model_config)
+    
+    # Load and dispatch the model across available GPUs
+    model = load_checkpoint_and_dispatch(
+        model, 
+        model_ckpt, 
+        device_map="auto",
+        no_split_module_classes=["ControlNet", "UNetModel", "VAEDecoder", "VAEEncoder"]
+    )
+else:
+    # Single GPU case
+    model.load_state_dict(state_dict)
+    model = model.cuda()
+
+# Create sampler
 ddim_sampler = DDIMSampler(model)
 
+# Function to get the actual model (handles both DataParallel and distributed cases)
+def get_actual_model(model):
+    if isinstance(model, nn.DataParallel):
+        return model.module
+    return model
 
+# Function to handle model method calls (handles both DataParallel and distributed cases)
+def call_model_method(model, method_name, *args, **kwargs):
+    actual_model = get_actual_model(model)
+    method = getattr(actual_model, method_name)
+    return method(*args, **kwargs)
 
 def aug_tar_mask(mask, kernal_size=0.001):
     w, h = mask.shape[1], mask.shape[0]
@@ -59,8 +101,6 @@ def aug_tar_mask(mask, kernal_size=0.001):
             if mask[i,j] == 1:
                 aug_mask[max(i-int(kernal_size*h), 0):min(i+int(kernal_size*h), h),max(j-int(kernal_size*w),0):min(j+int(kernal_size*w),w)] = 1
     return aug_mask
-
-
 
 def process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold):
     # ========= Reference ===========
@@ -215,30 +255,6 @@ def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
     return gen_image
 
 
-def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
-    H1, W1, H2, W2 = extra_sizes
-    y1,y2,x1,x2 = tar_box_yyxx_crop    
-    pred = cv2.resize(pred, (W2, H2))
-    m = 5 # maigin_pixel
-
-    if W1 == H1:
-        tar_image[y1+m :y2-m, x1+m:x2-m, :] =  pred[m:-m, m:-m]
-        return tar_image
-
-    if W1 < W2:
-        pad1 = int((W2 - W1) / 2)
-        pad2 = W2 - W1 - pad1
-        pred = pred[:,pad1: -pad2, :]
-    else:
-        pad1 = int((H2 - H1) / 2)
-        pad2 = H2 - H1 - pad1
-        pred = pred[pad1: -pad2, :, :]
-
-    gen_image = tar_image.copy()
-    gen_image[y1+m :y2-m, x1+m:x2-m, :] =  pred[m:-m, m:-m]
-    return gen_image
-
-
 def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num=10, sobel_color=False, sobel_threshold=20, guidance_scale = 5.0):
     item = process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold)
     ref = item['ref'] * 255
@@ -255,7 +271,7 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     
     seed = random.randint(0, 65535)
     if save_memory:
-        model.low_vram_shift(is_diffusing=False)
+        call_model_method(model, "low_vram_shift", is_diffusing=False)
 
     ref = item['ref']
     tar = item['jpg'] 
@@ -279,17 +295,14 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     H,W = 512,512
 
     # Handle model conditioning for multiple GPUs
-    if isinstance(model, nn.DataParallel):
-        cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [model.module.get_learned_conditioning(clip_input)]}
-        un_cond = {"c_concat_detail": None if guess_mode else [control_detail], "c_concat_depth": None if guess_mode else [control_depth], "c_crossattn": [model.module.get_learned_conditioning([torch.zeros((1,3,224,224))] * num_samples)]}
-    else:
-        cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
-        un_cond = {"c_concat_detail": None if guess_mode else [control_detail], "c_concat_depth": None if guess_mode else [control_depth], "c_crossattn": [model.get_learned_conditioning([torch.zeros((1,3,224,224))] * num_samples)]}
+    actual_model = get_actual_model(model)
+    cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [actual_model.get_learned_conditioning(clip_input)]}
+    un_cond = {"c_concat_detail": None if guess_mode else [control_detail], "c_concat_depth": None if guess_mode else [control_depth], "c_crossattn": [actual_model.get_learned_conditioning([torch.zeros((1,3,224,224))] * num_samples)]}
 
     shape = (4, H // 8, W // 8)
 
     if save_memory:
-        model.low_vram_shift(is_diffusing=True)
+        call_model_method(model, "low_vram_shift", is_diffusing=True)
 
     # ====
     num_samples = 1
@@ -301,23 +314,20 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     seed = -1
     eta = 0.0
 
-    if isinstance(model, nn.DataParallel):
-        model.module.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
-    else:
-        model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
+    # Set control scales
+    actual_model = get_actual_model(model)
+    actual_model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
 
     samples, intermediates = ddim_sampler.sample(ddim_steps, num_samples,
                                                 shape, cond, verbose=False, eta=eta,
                                                 unconditional_guidance_scale=scale,
                                                 unconditional_conditioning=un_cond)
     if save_memory:
-        model.low_vram_shift(is_diffusing=False)
+        call_model_method(model, "low_vram_shift", is_diffusing=False)
 
-    if isinstance(model, nn.DataParallel):
-        x_samples = model.module.decode_first_stage(samples)
-    else:
-        x_samples = model.decode_first_stage(samples)
-        
+    # Decode samples
+    actual_model = get_actual_model(model)
+    x_samples = actual_model.decode_first_stage(samples)
     x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
 
     result = x_samples[0][:,:,::-1]
