@@ -6,8 +6,15 @@ import random
 import os
 import sys
 import time
+# Splitting GPUs for different models
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 # sys.path.insert(0, '/home/ec2-user/SageMaker/Codes/ControlNet')
+
+print("GPU allocation:")
+print("- ControlNet model: GPU 0")
+print("- SAM model: GPU 1")
+print("- DPT Depth model: GPU 2") 
+print("- LLaVA model: GPU 3")
 
 from pytorch_lightning import seed_everything
 from cldm.model import create_model, load_state_dict
@@ -25,9 +32,19 @@ from datasets.data_utils import *
 from DPT.run_monodepth_api import run, initialize_dpt_model
 from segment_anything import SamPredictor, sam_model_registry
 import matplotlib.pyplot as plt
+
+# Assign models to different GPUs
+controlnet_device = "cuda:0"
+sam_device = "cuda:1"
+dpt_device = "cuda:2"
+
+# Load SAM on GPU 1
 sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
+sam = sam.to(sam_device)
 predictor = SamPredictor(sam)
-dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
+
+# Load DPT model on GPU 2
+dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt', device=dpt_device)
 
 
 save_memory = False
@@ -40,9 +57,10 @@ config = OmegaConf.load('./configs/inference.yaml')
 model_ckpt =  config.pretrained_model
 model_config = config.config_file
 
-model = create_model(model_config ).cpu()
-model.load_state_dict(load_state_dict(model_ckpt, location='cuda'))
-model = model.cuda()
+# Load ControlNet model on GPU 0
+model = create_model(model_config).cpu()
+model.load_state_dict(load_state_dict(model_ckpt, location=controlnet_device))
+model = model.to(controlnet_device)
 ddim_sampler = DDIMSampler(model)
 
 
@@ -258,23 +276,26 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     hint = item['hint']
     depth = item['depth']
     
-    control_detail = torch.from_numpy(hint.copy()).float().cuda() 
+    # Get appropriate devices
+    model_device = next(model.parameters()).device
+    
+    control_detail = torch.from_numpy(hint.copy()).float().to(model_device)
     control_detail = torch.stack([control_detail for _ in range(num_samples)], dim=0)
     control_detail = einops.rearrange(control_detail, 'b h w c -> b c h w').clone()
     
-    control_depth = torch.from_numpy(depth.copy()).float().cuda() 
+    control_depth = torch.from_numpy(depth.copy()).float().to(model_device)
     control_depth = torch.stack([control_depth for _ in range(num_samples)], dim=0)
     control_depth = einops.rearrange(control_depth, 'b h w c -> b c h w').clone()
 
-    clip_input = torch.from_numpy(ref.copy()).float().cuda() 
+    clip_input = torch.from_numpy(ref.copy()).float().to(model_device)
     clip_input = torch.stack([clip_input for _ in range(num_samples)], dim=0)
     clip_input = einops.rearrange(clip_input, 'b h w c -> b c h w').clone()
 
     guess_mode = False
     H,W = 512,512
 
-    cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [model.get_learned_conditioning( clip_input )]}
-    un_cond = {"c_concat_detail": None if guess_mode else [control_detail], "c_concat_depth": None if guess_mode else [control_depth], "c_crossattn": [model.get_learned_conditioning([torch.zeros((1,3,224,224))] * num_samples)]}
+    cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
+    un_cond = {"c_concat_detail": None if guess_mode else [control_detail], "c_concat_depth": None if guess_mode else [control_depth], "c_crossattn": [model.get_learned_conditioning([torch.zeros((1,3,224,224), device=model_device)] * num_samples)]}
     shape = (4, H // 8, W // 8)
 
     if save_memory:
@@ -439,13 +460,21 @@ if __name__ == '__main__':
     predictor.set_image(image)
     point_coords = np.array([[h*ref_object_location[1], w*ref_object_location[0]]])
     point_labels = np.array([1])
-    masks, _, _ = predictor.predict(point_coords=point_coords,
-                                    point_labels=point_labels,
-                                    multimask_output=True)
+    
+    # Move inputs to the SAM device and get predictions
+    point_coords_tensor = torch.from_numpy(point_coords).to(sam_device)
+    point_labels_tensor = torch.from_numpy(point_labels).to(sam_device)
+    
+    masks, _, _ = predictor.predict(point_coords=point_coords_tensor,
+                                   point_labels=point_labels_tensor,
+                                   multimask_output=True)
+    
+    # Move results back to CPU
+    masks = [mask.cpu().numpy() if isinstance(mask, torch.Tensor) else mask for mask in masks]
+    
     # save the mask image
     mask = masks[1].astype(np.uint8)
     # cv2.imwrite(ref_image_mask_path, mask)
-    mask = cv2.imread(ref_image_mask_path, cv2.IMREAD_UNCHANGED)
     ref_mask = (mask[:, :] > 0).astype(np.uint8)
     ref_image = image
     if mode == 'draw':
@@ -454,9 +483,18 @@ if __name__ == '__main__':
         predictor.set_image(back_image)
         point_coords = np.array([[w_back*bg_object_location[0], h_back*bg_object_location[1]]])
         point_labels = np.array([1])
-        masks, _, _ = predictor.predict(point_coords=point_coords,
-                                        point_labels=point_labels,
-                                        multimask_output=True)
+        
+        # Move inputs to the SAM device and get predictions
+        point_coords_tensor = torch.from_numpy(point_coords).to(sam_device)
+        point_labels_tensor = torch.from_numpy(point_labels).to(sam_device)
+        
+        masks, _, _ = predictor.predict(point_coords=point_coords_tensor,
+                                       point_labels=point_labels_tensor,
+                                       multimask_output=True)
+        
+        # Move results back to CPU
+        masks = [mask.cpu().numpy() if isinstance(mask, torch.Tensor) else mask for mask in masks]
+        
         # save the mask image
         back_mask = masks[1].astype(np.uint8)
         # cv2.imwrite(bg_mask_path, back_mask)

@@ -13,8 +13,9 @@ import glob
 import torch
 import cv2
 import argparse
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Let the main script control GPU usage
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
 
@@ -30,98 +31,9 @@ def run(model, transform, input_path, output_path, model_type="dpt_large", optim
         model_path (str): path to saved model
     """
 
-    # select device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    '''
-    # load network
-    if model_type == "dpt_large":  # DPT-Large
-        net_w = net_h = 384
-        model = DPTDepthModel(
-            path=model_path,
-            backbone="vitl16_384",
-            non_negative=True,
-            enable_attention_hooks=False,
-        )
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    elif model_type == "dpt_hybrid":  # DPT-Hybrid
-        net_w = net_h = 384
-        model = DPTDepthModel(
-            path=model_path,
-            backbone="vitb_rn50_384",
-            non_negative=True,
-            enable_attention_hooks=False,
-        )
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    elif model_type == "dpt_hybrid_kitti":
-        net_w = 1216
-        net_h = 352
-
-        model = DPTDepthModel(
-            path=model_path,
-            scale=0.00006016,
-            shift=0.00579,
-            invert=True,
-            backbone="vitb_rn50_384",
-            non_negative=True,
-            enable_attention_hooks=False,
-        )
-
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    elif model_type == "dpt_hybrid_nyu":
-        net_w = 640
-        net_h = 480
-
-        model = DPTDepthModel(
-            path=model_path,
-            scale=0.000305,
-            shift=0.1378,
-            invert=True,
-            backbone="vitb_rn50_384",
-            non_negative=True,
-            enable_attention_hooks=False,
-        )
-
-        normalization = NormalizeImage(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    elif model_type == "midas_v21":  # Convolutional model
-        net_w = net_h = 384
-
-        model = MidasNet_large(model_path, non_negative=True)
-        normalization = NormalizeImage(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        )
-    else:
-        assert (
-            False
-        ), f"model_type '{model_type}' not implemented, use: --model_type [dpt_large|dpt_hybrid|dpt_hybrid_kitti|dpt_hybrid_nyu|midas_v21]"
-
-    transform = Compose(
-        [
-            Resize(
-                net_w,
-                net_h,
-                resize_target=None,
-                keep_aspect_ratio=True,
-                ensure_multiple_of=32,
-                resize_method="minimal",
-                image_interpolation_method=cv2.INTER_CUBIC,
-            ),
-            normalization,
-            PrepareForNet(),
-        ]
-    )
-
-    model.eval()
-
-    if optimize == True and device == torch.device("cuda"):
-        model = model.to(memory_format=torch.channels_last)
-        model = model.half()
-
-    model.to(device)
-'''
+    # Get the device the model is on
+    device = next(model.parameters()).device
+    
     # get input
     img_names = glob.glob(os.path.join(input_path, "*"))
     num_images = len(img_names)
@@ -141,7 +53,7 @@ def run(model, transform, input_path, output_path, model_type="dpt_large", optim
         with torch.no_grad():
             sample = torch.from_numpy(img_input).to(device).unsqueeze(0)
 
-            if optimize == True and device == torch.device("cuda"):
+            if optimize == True and device.type == "cuda":
                 sample = sample.to(memory_format=torch.channels_last)
                 sample = sample.half()
 
@@ -171,8 +83,12 @@ def run(model, transform, input_path, output_path, model_type="dpt_large", optim
                             absolute_depth=False)
         
 
-def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True, device=None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+        
     if model_type == "dpt_large":  # DPT-Large
         net_w = net_h = 384
         model = DPTDepthModel(
@@ -201,7 +117,7 @@ def initialize_dpt_model(model_path, model_type="dpt_large", optimize=True):
 
     model.eval()
 
-    if optimize == True and device == torch.device("cuda"):
+    if optimize == True and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
         model = model.half()
 
