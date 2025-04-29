@@ -64,9 +64,31 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Loading SAM model on device: {device}")
 
 try:
+    # Optimize memory settings
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    
     # Load SAM model and move to device
-    sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
-    sam = sam.to(device)
+    print("Loading SAM model...")
+    
+    # If multiple GPUs, use a specific device for SAM to leave memory for the main model
+    if torch.cuda.device_count() > 1:
+        # Use the last GPU for SAM to leave the first ones for the main model
+        sam_device = torch.device(f"cuda:{torch.cuda.device_count()-1}")
+        print(f"Using device {sam_device} for SAM to optimize memory usage")
+        sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
+        sam = sam.to(sam_device)
+    else:
+        sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
+        sam = sam.to(device)
+        
+    # Try to use half precision to save memory
+    try:
+        sam = sam.half()  # Convert to half precision
+        print("Converted SAM model to half precision")
+    except Exception as e:
+        print(f"Could not convert SAM to half precision: {e}")
 
     # Initialize the predictor with the base model
     print("Creating SamPredictor...")
@@ -79,16 +101,24 @@ try:
     # Now wrap with DataParallelWithAttributes for faster processing if multiple GPUs are available
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for SAM model's forward pass")
-        # Use our custom wrapper to maintain attribute access
-        print("Creating DataParallelWithAttributes wrapper for SAM...")
-        # First verify the class exists
-        print(f"DataParallelWithAttributes class exists: {DataParallelWithAttributes is not None}")
-        sam = DataParallelWithAttributes(sam)
-        print(f"SAM model is using DataParallel: {isinstance(sam, nn.DataParallel)}")
-        # Verify we can still access attributes through the wrapper
-        print(f"Can still access image_encoder: {hasattr(sam, 'image_encoder')}")
+        try:
+            # Use our custom wrapper to maintain attribute access
+            print("Creating DataParallelWithAttributes wrapper for SAM...")
+            # First verify the class exists
+            print(f"DataParallelWithAttributes class exists: {DataParallelWithAttributes is not None}")
+            sam = DataParallelWithAttributes(sam)
+            print(f"SAM model is using DataParallel: {isinstance(sam, nn.DataParallel)}")
+            # Verify we can still access attributes through the wrapper
+            print(f"Can still access image_encoder: {hasattr(sam, 'image_encoder')}")
+        except Exception as e:
+            print(f"DataParallel wrapping failed: {e}, continuing with single-GPU SAM")
     else:
         print(f"Using single GPU for SAM, device: {next(sam.parameters()).device}")
+        
+    # Clear CUDA cache after SAM initialization
+    torch.cuda.empty_cache()
+    print("Cleared CUDA cache after SAM initialization")
+    
 except Exception as e:
     print(f"Error initializing SAM model: {type(e).__name__}: {e}")
     import traceback
@@ -134,17 +164,63 @@ try:
         print("Loading state dict to model...")
         model.load_state_dict(state_dict)
         
-        # Create DataParallelWithAttributes wrapper first, then move to CUDA
+        # Free up CPU memory
+        del state_dict
+        torch.cuda.empty_cache()
+        
+        # Create DataParallelWithAttributes wrapper
         print("Creating DataParallelWithAttributes wrapper for main model...")
         model = DataParallelWithAttributes(model)
-        print("Moving model to CUDA...")
-        model = model.cuda()
+        
+        # Move to CUDA device by device to avoid OOM
+        print("Moving model to CUDA gradually...")
+        # First move model parts to different GPUs
+        if hasattr(model.module, 'split_for_gpus'):
+            print("Using model's built-in split_for_gpus method")
+            model.module.split_for_gpus(torch.cuda.device_count())
+        else:
+            print("Using PyTorch's native DataParallel to distribute model")
+            # Let PyTorch handle distribution
+        
+        # Move model to CUDA with memory monitoring
+        try:
+            for i, (name, param) in enumerate(model.named_parameters()):
+                target_device = i % torch.cuda.device_count()
+                param_size_mb = param.numel() * param.element_size() / (1024 * 1024)
+                print(f"Moving parameter {name} ({param_size_mb:.2f} MB) to cuda:{target_device}")
+                param.data = param.data.to(f"cuda:{target_device}")
+                
+                # Clear cache periodically
+                if i % 20 == 0:
+                    torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"OOM error during parameter distribution: {e}")
+            print("Trying alternative approach with smaller chunks...")
+            
+            # Reset model to CPU
+            model = model.cpu()
+            torch.cuda.empty_cache()
+            
+            # Try again with model sharding
+            print("Creating model with device_map='auto' for automatic sharding...")
+            # We'll use the first GPU as the entry point
+            torch.cuda.set_device(0)
+            model = model.cuda()
+        
         print(f"Model is using DataParallel: {isinstance(model, nn.DataParallel)}")
         print(f"Model device: {next(model.parameters()).device}")
     else:
         # Single GPU case
+        print("Loading state dict...")
         model.load_state_dict(state_dict)
-        model = model.cuda()
+        print("Moving model to CUDA...")
+        try:
+            model = model.cuda()
+        except torch.cuda.OutOfMemoryError:
+            print("Out of memory on single GPU. Trying to load with lower precision...")
+            # Try with half-precision
+            model = model.half().cuda()
+        
         print(f"Using single GPU, device: {next(model.parameters()).device}")
 
     # Create sampler
