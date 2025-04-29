@@ -36,51 +36,135 @@ from DPT.run_monodepth_api import run, initialize_dpt_model
 from segment_anything import SamPredictor, sam_model_registry
 import matplotlib.pyplot as plt
 
-# Initialize devices based on availability
-if num_gpus >= 3:
+# Recursively move an entire model to the device
+def move_to_device(model, device):
+    if hasattr(model, 'to'):
+        model = model.to(device)
+    
+    # Recursively move internal models
+    for attr_name in dir(model):
+        try:
+            attr = getattr(model, attr_name)
+            if isinstance(attr, torch.nn.Module):
+                setattr(model, attr_name, move_to_device(attr, device))
+            elif attr_name == 'model' and hasattr(attr, 'to'):
+                setattr(model, attr_name, attr.to(device))
+        except: 
+            pass
+    return model
+
+# Configure device allocation based on available GPUs
+if num_gpus >= 2:
     # Multi-GPU setup
+    # SAM is smallest, put on GPU 0
     device_sam = torch.device("cuda:0")
+    # DPT is medium, put on GPU 1
     device_dpt = torch.device("cuda:1")
-    device_model = torch.device("cuda:2")
-elif num_gpus == 2:
-    # Two GPU setup - put SAM and model on separate GPUs, DPT shares with SAM
-    device_sam = torch.device("cuda:0")
-    device_dpt = torch.device("cuda:0")  # Share with SAM
-    device_model = torch.device("cuda:1")
+    # Main model is largest, put on remaining GPU with most memory
+    if num_gpus >= 3:
+        device_model = torch.device("cuda:2")
+    else:
+        # With only 2 GPUs, put the main model on GPU 1 with DPT
+        # (better to have SAM isolated as it's used frequently)
+        device_model = torch.device("cuda:1") 
 else:
-    # Single GPU setup - everything on one GPU
+    # Only 1 GPU - need to use more aggressive memory management
     device_sam = torch.device("cuda:0")
     device_dpt = torch.device("cuda:0")
     device_model = torch.device("cuda:0")
 
 print(f"SAM on {device_sam}, DPT on {device_dpt}, Main model on {device_model}")
 
-# Load SAM
-sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
-sam = sam.to(device_sam)
-predictor = SamPredictor(sam)
-
-# Load DPT
-dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
-if hasattr(dpt_model, 'to'):
-    dpt_model = dpt_model.to(device_dpt)
-
-save_memory = True  # Enable memory saving features
+# Enable memory saving for all operations
+save_memory = True
 disable_verbosity()
 if save_memory:
     enable_sliced_attention()
+
+# Enable memory tracking for debugging
+if torch.cuda.is_available():
+    for i in range(num_gpus):
+        print(f"GPU {i} memory: {torch.cuda.memory_allocated(i)/(1024**2):.2f}MB / {torch.cuda.get_device_properties(i).total_memory/(1024**2):.2f}MB")
+
+# Load SAM on GPU 0
+torch.cuda.set_device(device_sam.index)
+torch.cuda.empty_cache()
+sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
+sam = sam.to(device_sam)
+predictor = SamPredictor(sam)
+print(f"SAM loaded on {device_sam}, memory: {torch.cuda.memory_allocated(device_sam.index)/(1024**2):.2f}MB")
+
+# Load DPT on GPU 1
+torch.cuda.set_device(device_dpt.index)
+torch.cuda.empty_cache()
+dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
+dpt_model = move_to_device(dpt_model, device_dpt)
+print(f"DPT loaded on {device_dpt}, memory: {torch.cuda.memory_allocated(device_dpt.index)/(1024**2):.2f}MB")
 
 config = OmegaConf.load('./configs/inference.yaml')
 model_ckpt = config.pretrained_model
 model_config = config.config_file
 
-# Create and load main model
+# Create and load main model on appropriate GPU
+torch.cuda.set_device(device_model.index)
+torch.cuda.empty_cache()
 print(f"Loading main model from {model_ckpt} to {device_model}")
 model = create_model(model_config)
-# Use 'cpu' as intermediate loading location to save GPU memory
 model.load_state_dict(load_state_dict(model_ckpt, location='cpu'))
 model = model.to(device_model)
 ddim_sampler = DDIMSampler(model)
+print(f"Main model loaded on {device_model}, memory: {torch.cuda.memory_allocated(device_model.index)/(1024**2):.2f}MB")
+
+# Handle the case where main model and DPT share GPU 1
+if device_model == device_dpt:
+    print("WARNING: Main model and DPT sharing same GPU - will unload/reload as needed")
+    # Clear some references to help with garbage collection
+    del dpt_model
+    torch.cuda.empty_cache()
+    print(f"After unloading DPT, GPU {device_model.index} memory: {torch.cuda.memory_allocated(device_model.index)/(1024**2):.2f}MB")
+    dpt_reloaded = False
+else:
+    dpt_reloaded = True
+
+# Function to run DPT with appropriate device handling
+def run_dpt(input_folder, output_folder):
+    global dpt_model, dpt_reloaded, transform
+    
+    # If DPT shares GPU with main model, we need special handling
+    if device_model == device_dpt and not dpt_reloaded:
+        torch.cuda.set_device(device_dpt.index)
+        # Temporarily move main model to CPU to free memory
+        print("Moving main model to CPU temporarily...")
+        model.to('cpu')
+        torch.cuda.empty_cache()
+        # Reload DPT
+        print("Reloading DPT model...")
+        dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
+        dpt_model = move_to_device(dpt_model, device_dpt)
+        dpt_reloaded = True
+    
+    # Ensure DPT is on the right device
+    dpt_model = move_to_device(dpt_model, device_dpt)
+    
+    # Check device consistency
+    for param in dpt_model.parameters():
+        if param.device != device_dpt:
+            print(f"WARNING: Parameter on wrong device: {param.device} vs {device_dpt}")
+            param.data = param.data.to(device_dpt)
+    
+    # Run DPT
+    with torch.cuda.device(device_dpt.index):
+        run(dpt_model, transform, input_folder, output_folder)
+    
+    # If DPT shares GPU with main model, unload it afterward
+    if device_model == device_dpt:
+        print("Unloading DPT to free memory...")
+        del dpt_model
+        torch.cuda.empty_cache()
+        dpt_reloaded = False
+        # Move main model back to GPU
+        print("Moving main model back to GPU...")
+        model.to(device_model)
 
 # Function to ensure operations run on correct device
 def to_device(tensor, device):
@@ -253,6 +337,8 @@ def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
 
 
 def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num=10, sobel_color=False, sobel_threshold=20, guidance_scale = 5.0):
+    global model
+    
     item = process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold)
     ref = item['ref'] * 255
     tar = item['jpg'] * 127.5 + 127.5
@@ -266,6 +352,9 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     vis = cv2.hconcat([ref.astype(np.float32), depth.astype(np.float32), hint_image.astype(np.float32), hint_mask.astype(np.float32)])
     cv2.imwrite('sample_vis_test.jpg',vis[:,:,::-1])
     
+    # Ensure we're using the main model's GPU
+    torch.cuda.set_device(device_model.index)
+    
     seed = random.randint(0, 65535)
     if save_memory:
         model.low_vram_shift(is_diffusing=False)
@@ -275,7 +364,7 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     hint = item['hint']
     depth = item['depth']
     
-    # Move tensors to the model device
+    # Move tensors to the main model device
     control_detail = torch.from_numpy(hint.copy()).float().to(device_model)
     control_detail = torch.stack([control_detail for _ in range(num_samples)], dim=0)
     control_detail = einops.rearrange(control_detail, 'b h w c -> b c h w').clone()
@@ -291,46 +380,47 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     guess_mode = False
     H,W = 512,512
 
-    cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
-    
-    # Create empty tensor on the same device
-    empty_tensor = torch.zeros((1,3,224,224), device=device_model)
-    
-    un_cond = {"c_concat_detail": None if guess_mode else [control_detail], 
-               "c_concat_depth": None if guess_mode else [control_depth], 
-               "c_crossattn": [model.get_learned_conditioning([empty_tensor] * num_samples)]}
-    
-    shape = (4, H // 8, W // 8)
+    with torch.cuda.device(device_model.index):
+        cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
+        
+        # Create empty tensor on the same device
+        empty_tensor = torch.zeros((1,3,224,224), device=device_model)
+        
+        un_cond = {"c_concat_detail": None if guess_mode else [control_detail], 
+                  "c_concat_depth": None if guess_mode else [control_depth], 
+                  "c_crossattn": [model.get_learned_conditioning([empty_tensor] * num_samples)]}
+        
+        shape = (4, H // 8, W // 8)
 
-    if save_memory:
-        model.low_vram_shift(is_diffusing=True)
+        if save_memory:
+            model.low_vram_shift(is_diffusing=True)
 
-    # ====
-    num_samples = 1
-    image_resolution = 512
-    strength = 1
-    guess_mode = False
-    ddim_steps = 50
-    scale = guidance_scale
-    seed = -1
-    eta = 0.0
+        # ====
+        num_samples = 1
+        image_resolution = 512
+        strength = 1
+        guess_mode = False
+        ddim_steps = 50
+        scale = guidance_scale
+        seed = -1
+        eta = 0.0
 
-    model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
-    
-    # Run sampling with memory optimization
-    with torch.cuda.amp.autocast(enabled=save_memory):  # Use mixed precision if saving memory
-        samples, intermediates = ddim_sampler.sample(ddim_steps, num_samples,
-                                                    shape, cond, verbose=False, eta=eta,
-                                                    unconditional_guidance_scale=scale,
-                                                    unconditional_conditioning=un_cond)
-    
-    if save_memory:
-        model.low_vram_shift(is_diffusing=False)
-        # Clear intermediate cache to save memory
-        torch.cuda.empty_cache()
+        model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
+        
+        # Run sampling with memory optimization
+        with torch.cuda.amp.autocast(enabled=save_memory):  # Use mixed precision to save memory
+            samples, intermediates = ddim_sampler.sample(ddim_steps, num_samples,
+                                                        shape, cond, verbose=False, eta=eta,
+                                                        unconditional_guidance_scale=scale,
+                                                        unconditional_conditioning=un_cond)
+        
+        if save_memory:
+            model.low_vram_shift(is_diffusing=False)
+            # Clear cache to save memory
+            torch.cuda.empty_cache()
 
-    x_samples = model.decode_first_stage(samples)
-    x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
+        x_samples = model.decode_first_stage(samples)
+        x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
 
     result = x_samples[0][:,:,::-1]
     result = np.clip(result,0,255)
@@ -469,15 +559,19 @@ if __name__ == '__main__':
     ref_image = image 
     ref_mask = mask
     '''
+    # Check device before every major operation to ensure consistency
+    print(f"DPT model device check: {next(dpt_model.parameters()).device}")
+    
     # Use SAM to predict the mask for reference image
-    torch.cuda.empty_cache()  # Clear cache before heavy operations
-    predictor.reset_image()  # Reset previous image state
-    predictor.set_image(image)
-    point_coords = np.array([[h*ref_object_location[1], w*ref_object_location[0]]])
-    point_labels = np.array([1])
-    masks, _, _ = predictor.predict(point_coords=point_coords,
-                                    point_labels=point_labels,
-                                    multimask_output=True)
+    with torch.cuda.device(device_sam.index):
+        torch.cuda.empty_cache()  # Clear cache before heavy operations
+        predictor.reset_image()  # Reset previous image state
+        predictor.set_image(image)
+        point_coords = np.array([[h*ref_object_location[1], w*ref_object_location[0]]])
+        point_labels = np.array([1])
+        masks, _, _ = predictor.predict(point_coords=point_coords,
+                                        point_labels=point_labels,
+                                        multimask_output=True)
     # save the mask image
     mask = masks[1].astype(np.uint8)
     # cv2.imwrite(ref_image_mask_path, mask)
@@ -487,21 +581,21 @@ if __name__ == '__main__':
     if mode == 'draw':
         h_back, w_back = back_image.shape[0], back_image.shape[1]
         # Use SAM to predict the mask for background image
-        torch.cuda.empty_cache()  # Clear cache before heavy operations
-        predictor.reset_image()  # Reset previous image state
-        predictor.set_image(back_image)
-        point_coords = np.array([[w_back*bg_object_location[0], h_back*bg_object_location[1]]])
-        point_labels = np.array([1])
-        masks, _, _ = predictor.predict(point_coords=point_coords,
-                                        point_labels=point_labels,
-                                        multimask_output=True)
+        with torch.cuda.device(device_sam.index):
+            torch.cuda.empty_cache()  # Clear cache before heavy operations
+            predictor.reset_image()  # Reset previous image state
+            predictor.set_image(back_image)
+            point_coords = np.array([[w_back*bg_object_location[0], h_back*bg_object_location[1]]])
+            point_labels = np.array([1])
+            masks, _, _ = predictor.predict(point_coords=point_coords,
+                                            point_labels=point_labels,
+                                            multimask_output=True)
         # save the mask image
         back_mask = masks[1].astype(np.uint8)
         # cv2.imwrite(bg_mask_path, back_mask)
 
     # Get the depth map using DPT
-    torch.cuda.empty_cache()  # Clear cache before heavy operations
-    run(dpt_model, transform, input_folder, output_folder)
+    run_dpt(input_folder, output_folder)
 
 
     # transform reference image style to the background image style
