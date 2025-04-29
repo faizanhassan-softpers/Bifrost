@@ -8,6 +8,7 @@ import sys
 import time
 # Set CUDA_VISIBLE_DEVICES to use specific GPUs
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+print(f"CUDA_VISIBLE_DEVICES set to: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
 # sys.path.insert(0, '/home/ec2-user/SageMaker/Codes/ControlNet')
 
 from pytorch_lightning import seed_everything
@@ -38,13 +39,22 @@ for i in range(torch.cuda.device_count()):
 # Initialize models with GPU settings
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Loading SAM model on device: {device}")
+
+# Load SAM model on CPU first
 sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
-sam = sam.to(device)
+
+# Check available GPUs again
+print(f"CUDA device count before SAM init: {torch.cuda.device_count()}")
 
 # Use DataParallel for SAM model if multiple GPUs are available
 if torch.cuda.device_count() > 1:
     print(f"Using {torch.cuda.device_count()} GPUs for SAM model")
     sam = nn.DataParallel(sam)
+    sam = sam.cuda()
+    print(f"SAM model is using DataParallel: {isinstance(sam, nn.DataParallel)}")
+else:
+    sam = sam.to(device)
+    print(f"Using single GPU for SAM, device: {next(sam.parameters()).device}")
 
 predictor = SamPredictor(sam)
 
@@ -63,21 +73,26 @@ model_config = config.config_file
 
 # Create model on CPU first
 model = create_model(model_config).cpu()
-state_dict = load_state_dict(model_ckpt, location='cuda')
+state_dict = load_state_dict(model_ckpt, location='cpu')  # Load to CPU first
 
 # Check if multiple GPUs are available
+print(f"CUDA device count before model init: {torch.cuda.device_count()}")
 if torch.cuda.device_count() > 1:
     print(f"Using {torch.cuda.device_count()} GPUs for inference!")
     
-    # Move model to CUDA before wrapping with DataParallel
+    # Load state dict on CPU first
     model.load_state_dict(state_dict)
-    model = model.cuda()
-    # Use DataParallel to distribute model across all available GPUs
+    
+    # Create DataParallel wrapper first, then move to CUDA
     model = nn.DataParallel(model)
+    model = model.cuda()
+    print(f"Model is using DataParallel: {isinstance(model, nn.DataParallel)}")
+    print(f"Model device: {next(model.parameters()).device}")
 else:
     # Single GPU case
     model.load_state_dict(state_dict)
     model = model.cuda()
+    print(f"Using single GPU, device: {next(model.parameters()).device}")
 
 # Create sampler
 ddim_sampler = DDIMSampler(model)
@@ -257,6 +272,29 @@ def manage_gpu_memory():
         # Empty cache to free up memory
         torch.cuda.empty_cache()
         print("GPU cache cleared")
+
+# Verify GPU availability right after imports
+print("\nVerifying GPU availability:")
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"CUDA version: {torch.version.cuda}")
+print(f"Number of GPUs: {torch.cuda.device_count()}")
+
+for i in range(torch.cuda.device_count()):
+    print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+    
+# Force PyTorch to re-detect GPUs if only one is found
+if torch.cuda.device_count() < 2 and ',' in os.environ.get("CUDA_VISIBLE_DEVICES", "0"):
+    print("Warning: Expected multiple GPUs but only found one. Attempting to fix...")
+    # Clear CUDA cache
+    torch.cuda.empty_cache()
+    # Re-initialize CUDA
+    if hasattr(torch.cuda, 'reset_max_memory_allocated'):
+        torch.cuda.reset_max_memory_allocated()
+    if hasattr(torch.cuda, 'reset_max_memory_cached'):
+        torch.cuda.reset_max_memory_cached()
+    # Print updated count
+    print(f"Updated GPU count: {torch.cuda.device_count()}")
 
 # Update inference_single_image function to include memory management
 def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num=10, sobel_color=False, sobel_threshold=20, guidance_scale = 5.0):
@@ -456,9 +494,27 @@ def depth_mask_fusion(back_depth, ref_depth, back_mask, ref_mask, depth_scale=[0
 
 
 if __name__ == '__main__': 
-    # Set the CUDA device
+    # Set the CUDA device and verify all GPUs are detected
     if torch.cuda.is_available():
-        print(f"Using {torch.cuda.device_count()} GPUs for inference")
+        print(f"\nFinal GPU verification before starting inference:")
+        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+        print(f"PyTorch CUDA device count: {torch.cuda.device_count()}")
+        
+        # If we only have 1 GPU but should have more, try resetting CUDA
+        if torch.cuda.device_count() < 2 and ',' in os.environ.get("CUDA_VISIBLE_DEVICES", "0"):
+            print("Still only seeing 1 GPU. Trying alternative approach...")
+            # Try forcing device visibility a different way
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(',')
+            print(f"Should have {len(visible_devices)} GPUs: {visible_devices}")
+            
+            # Try updating the environment and reloading CUDA
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            torch.cuda.empty_cache()
+            
+            # Print what we have
+            print(f"Devices after reset:")
+            for i in range(torch.cuda.device_count()):
+                print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
         
         # Print GPU information 
         for i in range(torch.cuda.device_count()):
@@ -470,7 +526,7 @@ if __name__ == '__main__':
         # Initial memory status
         print("Initial GPU memory status:")
         manage_gpu_memory()
-
+    
     # ==== Example for inferring a single image ===
     ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'
     ref_image_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/object_mask.jpg'

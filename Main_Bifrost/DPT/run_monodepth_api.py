@@ -19,7 +19,8 @@ from PIL import Image
 import torchvision.transforms as transforms
 from DPT.util.misc import visualize_attention
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Allow DPT to use all available GPUs
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
 
