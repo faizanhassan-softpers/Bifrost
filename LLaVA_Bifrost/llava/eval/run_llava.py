@@ -2,7 +2,7 @@ import argparse
 import torch
 import os
 import time
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 from llava.constants import (
     IMAGE_TOKEN_INDEX,
@@ -151,15 +151,15 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=512)
     args = parser.parse_args()
     '''
-    model_path = "PATH_TO/LLaVA/llava/checkpoints/llava-v1.5-7b-task-lora-full-data-v4"
-    model_base = "PATH_TO/.cache/huggingface/hub/liuhaotian/llava-v1.5-7b"
-    # prompt = "Replace the vase with the reference image, output the bounding box and the depth value of the center point."
-    prompt = 'Place the cat behind the bed, output the bounding box and the depth value of the center point.'
-    image_file = "PATH_TO/datasets/ADE20K_2021_17_01/images_detectron2/training/ADE_train_00000283.jpg"
+    model_path = "liuhaotian/llava-v1.5-7b"
+    model_base = "liuhaotian/llava-v1.5-7b"
+    prompt = "Replace the bridge with the reference image, output the bounding box and the depth value of the center point."
+    # prompt = 'Place the cat in the middle of the picture.'
+    image_file = "/home/ec2-user/dev/DATA/view.jpg"
 
     args = type('Args', (), {
         "model_path": model_path,
-        "model_base": model_base,
+        "model_base": None,
         "model_name": get_model_name_from_path(model_path),
         "query": prompt,
         "conv_mode": None,
