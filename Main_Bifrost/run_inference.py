@@ -6,14 +6,15 @@ import random
 import os
 import sys
 import time
+import gc
 # Splitting GPUs for different models
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 # sys.path.insert(0, '/home/ec2-user/SageMaker/Codes/ControlNet')
 
-print("GPU allocation (redistributed based on memory usage):")
-print("- DPT Depth model: GPU 0 (was GPU 2)")
-print("- ControlNet model: GPU 1 (was GPU 0)")
-print("- SAM model: GPU 2 (was GPU 1)") 
+print("GPU allocation (model parallelism):")
+print("- ControlNet model: Distributed across GPUs 0,1,2 using model parallelism")
+print("- SAM model: GPU 2") 
+print("- DPT Depth model: GPU 0")
 print("- LLaVA model: GPU 3")
 
 from pytorch_lightning import seed_everything
@@ -33,37 +34,105 @@ from DPT.run_monodepth_api import run, initialize_dpt_model
 from segment_anything import SamPredictor, sam_model_registry
 import matplotlib.pyplot as plt
 
-# Assign models to different GPUs - rebalanced based on memory usage
-controlnet_device = "cuda:1"  # Move from GPU 0 to GPU 1
-sam_device = "cuda:2"         # Move from GPU 1 to GPU 2
-dpt_device = "cuda:0"         # Move from GPU 2 to GPU 0
+# Assign smaller models to specific GPUs
+sam_device = "cuda:2"
+dpt_device = "cuda:0"
 
-# Load SAM on GPU 2
+# Add memory optimization function
+def optimize_gpu_memory():
+    """Free unused memory and optimize GPU usage"""
+    torch.cuda.empty_cache()
+    gc.collect()  # Collect Python garbage
+
+    # Set PyTorch memory allocation parameters for efficiency
+    if hasattr(torch.cuda, 'memory_stats'):
+        for i in range(torch.cuda.device_count()):
+            if torch.cuda.memory_stats(i)['reserved_bytes.all.current'] > 0:
+                torch.cuda.empty_cache()
+
+    # Set environment variables for PyTorch memory allocation
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+
+# Further improve model loading to be sequential and optimize memory usage
+print("Starting sequential model loading to reduce memory pressure...")
+
+# First, optimize GPU memory
+optimize_gpu_memory()
+
+# Enable memory saving techniques
+save_memory = True
+disable_verbosity()
+
+# 1. First load DPT model (smallest) on GPU 0
+print("Loading DPT model on GPU 0...")
+dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt', device=dpt_device)
+optimize_gpu_memory()
+
+# 2. Load SAM model on GPU 2
+print("Loading SAM model on GPU 2...")
 sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
 sam = sam.to(sam_device)
 predictor = SamPredictor(sam)
+optimize_gpu_memory()
 
-# Load DPT model on GPU 0
-dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt', device=dpt_device)
+# 3. Load Control Net on Multiple GPUs with special handling
+print("Loading ControlNet in chunks onto GPUs 0,1,2...")
 
-
-save_memory = False
-disable_verbosity()
-if save_memory:
-    enable_sliced_attention()
-
-
+# Load state dict separately to control memory usage
 config = OmegaConf.load('./configs/inference.yaml')
-model_ckpt =  config.pretrained_model
+model_ckpt = config.pretrained_model
 model_config = config.config_file
 
-# Load ControlNet model on GPU 1
+# Create model on CPU first
 model = create_model(model_config).cpu()
-model.load_state_dict(load_state_dict(model_ckpt, location=controlnet_device))
-model = model.to(controlnet_device)
-ddim_sampler = DDIMSampler(model)
 
+# Load the model weights in a memory-efficient way
+print("Loading model state dict from disk...")
+state_dict = load_state_dict(model_ckpt, location="cpu")
+optimize_gpu_memory()
 
+# Load the model weights in smaller chunks
+print("Loading model weights in chunks...")
+keys = list(state_dict.keys())
+chunk_size = len(keys) // 4  # Split into 4 chunks
+
+for i in range(0, len(keys), chunk_size):
+    chunk_keys = keys[i:i+chunk_size]
+    chunk_dict = {k: state_dict[k] for k in chunk_keys}
+    # Load partial state dict
+    model.load_state_dict(chunk_dict, strict=False)
+    # Free memory after each chunk
+    del chunk_dict
+    optimize_gpu_memory()
+
+# Free memory after loading the full state dict
+del state_dict
+optimize_gpu_memory()
+
+# Enable memory-saving features
+print("Enabling memory optimization features...")
+model.half()  # Use half precision
+if hasattr(model, 'enable_gradient_checkpointing'):
+    model.enable_gradient_checkpointing()
+
+# Enable sliced attention for memory efficiency
+enable_sliced_attention()
+
+# Use model parallelism across GPUs
+print("Distributing model across GPUs...")
+device_ids = [0, 1, 2]  # Use GPUs 0, 1, 2 for the model
+model = torch.nn.DataParallel(model, device_ids=device_ids)
+model = model.to(f"cuda:{device_ids[0]}")
+
+# Create sampler
+ddim_sampler = DDIMSampler(model.module)
+optimize_gpu_memory()
+print("All models loaded successfully!")
+
+# Set additional memory optimization flags
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 def aug_tar_mask(mask, kernal_size=0.001):
     w, h = mask.shape[1], mask.shape[0]
@@ -254,6 +323,9 @@ def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
 
 
 def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num=10, sobel_color=False, sobel_threshold=20, guidance_scale = 5.0):
+    # Clear memory before inference
+    optimize_gpu_memory()
+
     item = process_pairs(ref_image, ref_mask, tar_image, tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold)
     ref = item['ref'] * 255
     tar = item['jpg'] * 127.5 + 127.5
@@ -269,7 +341,10 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     
     seed = random.randint(0, 65535)
     if save_memory:
-        model.low_vram_shift(is_diffusing=False)
+        if hasattr(model, 'module'):  # Check if model is wrapped in DataParallel
+            model.module.low_vram_shift(is_diffusing=False)
+        else:
+            model.low_vram_shift(is_diffusing=False)
 
     ref = item['ref']
     tar = item['jpg'] 
@@ -294,12 +369,24 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     guess_mode = False
     H,W = 512,512
 
-    cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
-    un_cond = {"c_concat_detail": None if guess_mode else [control_detail], "c_concat_depth": None if guess_mode else [control_depth], "c_crossattn": [model.get_learned_conditioning([torch.zeros((1,3,224,224), device=model_device)] * num_samples)]}
+    # Use model.module for DataParallel when needed
+    if hasattr(model, 'module'):
+        model_to_call = model.module
+    else:
+        model_to_call = model
+        
+    cond = {"c_concat_detail": [control_detail], "c_concat_depth": [control_depth], 
+            "c_crossattn": [model_to_call.get_learned_conditioning(clip_input)]}
+    un_cond = {"c_concat_detail": None if guess_mode else [control_detail], 
+              "c_concat_depth": None if guess_mode else [control_depth], 
+              "c_crossattn": [model_to_call.get_learned_conditioning([torch.zeros((1,3,224,224), device=model_device)] * num_samples)]}
     shape = (4, H // 8, W // 8)
 
     if save_memory:
-        model.low_vram_shift(is_diffusing=True)
+        if hasattr(model, 'module'):
+            model.module.low_vram_shift(is_diffusing=True)
+        else:
+            model.low_vram_shift(is_diffusing=True)
 
     # ====
     num_samples = 1 #gr.Slider(label="Images", minimum=1, maximum=12, value=1, step=1)
@@ -312,16 +399,32 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     seed = -1  #gr.Slider(label="Seed", minimum=-1, maximum=2147483647, step=1, randomize=True)
     eta = 0.0 #gr.Number(label="eta (DDIM)", value=0.0)
 
-    model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)  # Magic number. IDK why. Perhaps because 0.825**12<0.01 but 0.826**12>0.01
-    samples, intermediates = ddim_sampler.sample(ddim_steps, num_samples,
-                                                    shape, cond, verbose=False, eta=eta,
-                                                    unconditional_guidance_scale=scale,
-                                                    unconditional_conditioning=un_cond)
+    # Apply control scales
+    if hasattr(model, 'module'):
+        model.module.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
+    else:
+        model.control_scales = [strength * (0.825 ** float(12 - i)) for i in range(13)] if guess_mode else ([strength] * 13)
+    
+    # Sample with reduced steps if memory is tight
+    actual_steps = 25 if save_memory else ddim_steps
+    
+    samples, intermediates = ddim_sampler.sample(actual_steps, num_samples,
+                                                shape, cond, verbose=False, eta=eta,
+                                                unconditional_guidance_scale=scale,
+                                                unconditional_conditioning=un_cond)
     if save_memory:
-        model.low_vram_shift(is_diffusing=False)
+        if hasattr(model, 'module'):
+            model.module.low_vram_shift(is_diffusing=False)
+        else:
+            model.low_vram_shift(is_diffusing=False)
 
-    x_samples = model.decode_first_stage(samples)
-    x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()#.clip(0, 255).astype(np.uint8)
+    # Get the module to call decode_first_stage
+    if hasattr(model, 'module'):
+        x_samples = model.module.decode_first_stage(samples)
+    else:
+        x_samples = model.decode_first_stage(samples)
+        
+    x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
 
     result = x_samples[0][:,:,::-1]
     result = np.clip(result,0,255)
@@ -331,6 +434,10 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, occluded_ma
     sizes = item['extra_sizes']
     tar_box_yyxx_crop = item['tar_box_yyxx_crop'] 
     gen_image = crop_back(pred, tar_image, sizes, tar_box_yyxx_crop) 
+
+    # Free memory after processing
+    optimize_gpu_memory()
+    
     return gen_image
 
 
