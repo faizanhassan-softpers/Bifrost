@@ -100,6 +100,6 @@ model:
 
     cond_stage_config:
       target: ldm.modules.encoders.modules.FrozenDinoV2Encoder
-      weight: PATH_TO/dinov2_vitg14_pretrain.pth
+      weight: /home/ec2-user/SageMaker/model_weights/dinov2_vitg14_pretrain.pth
     
 

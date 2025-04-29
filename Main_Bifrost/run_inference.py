@@ -6,8 +6,8 @@ import random
 import os
 import sys
 import time
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-sys.path.insert(0, '/home/mhf/dxl/Lingxiao/Codes')
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+# sys.path.insert(0, '/home/ec2-user/SageMaker/Codes/ControlNet')
 
 from pytorch_lightning import seed_everything
 from cldm.model import create_model, load_state_dict
@@ -25,9 +25,9 @@ from datasets.data_utils import *
 from DPT.run_monodepth_api import run, initialize_dpt_model
 from segment_anything import SamPredictor, sam_model_registry
 import matplotlib.pyplot as plt
-sam = sam_model_registry["vit_h"](checkpoint="/data2/mhf/DXL/Lingxiao/Cache/model_weight/SAM/sam_vit_h_4b8939.pth")
+sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
 predictor = SamPredictor(sam)
-dpt_model, transform = initialize_dpt_model(model_path='/home/mhf/dxl/Lingxiao/Codes/DPT/weights/dpt_large-midas-2f21e586.pt')
+dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt')
 
 
 save_memory = False
@@ -369,22 +369,22 @@ def depth_mask_fusion(back_depth, ref_depth, back_mask, ref_mask, depth_scale=[0
 
 if __name__ == '__main__': 
     # ==== Example for inferring a single image ===
-    ref_image_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Input/object.jpg'
-    ref_image_mask_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Mask/object_mask.jpg'
-    ref_image_depth_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth/object.png'
+    ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'
+    ref_image_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/object_mask.jpg'
+    ref_image_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/object.png'
 
-    bg_image_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Input/background.jpg'
-    bg_mask_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Mask/background_mask.png'
-    bg_image_depth_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/Test/Depth/background.png'
+    bg_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/background.jpg'
+    bg_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/background_mask.png'
+    bg_image_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/Test/Depth/background.png'
 
-    fused_depth_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth/fused_depth.png'
-    fused_mask_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Mask/fused_mask.png'
+    fused_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/fused_depth.png'
+    fused_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/fused_mask.png'
 
-    save_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Gen/gen_res.png'
-    save_compose_path = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Gen/gen_res_compose.png'
+    save_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res.png'
+    save_compose_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res_compose.png'
 
-    input_folder = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Input'
-    output_folder = '/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth'
+    input_folder = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input'
+    output_folder = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth'
     # [x, y, w, h] in the range of [0, 1]
     bg_mask = [0.338, 0.521, 0.2, 0.32]
     ref_object_location = [0.5, 0.45] # [x, y] in the range of [0, 1]

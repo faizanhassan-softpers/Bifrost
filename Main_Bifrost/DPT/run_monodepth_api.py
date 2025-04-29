@@ -2,7 +2,7 @@
 """
 import sys
 sys.path.insert(
-    0, '/home/mhf/dxl/Lingxiao/Codes/DPT')
+    0, '/home/ec2-user/dev/Bifrost/Main_Bifrost/DPT')
 from dpt.transforms import Resize, NormalizeImage, PrepareForNet
 from dpt.midas_net import MidasNet_large
 from dpt.models import DPTDepthModel
