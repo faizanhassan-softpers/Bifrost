@@ -45,10 +45,14 @@ def optimize_gpu_memory():
     gc.collect()  # Collect Python garbage
 
     # Set PyTorch memory allocation parameters for efficiency
-    if hasattr(torch.cuda, 'memory_stats'):
-        for i in range(torch.cuda.device_count()):
-            if torch.cuda.memory_stats(i)['reserved_bytes.all.current'] > 0:
+    # More robust check for memory stats
+    try:
+        if hasattr(torch.cuda, 'memory_stats'):
+            for i in range(torch.cuda.device_count()):
                 torch.cuda.empty_cache()
+    except (KeyError, RuntimeError):
+        # Just empty cache if stats retrieval fails
+        torch.cuda.empty_cache()
 
     # Set environment variables for PyTorch memory allocation
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
@@ -63,76 +67,133 @@ optimize_gpu_memory()
 save_memory = True
 disable_verbosity()
 
-# 1. First load DPT model (smallest) on GPU 0
-print("Loading DPT model on GPU 0...")
-dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt', device=dpt_device)
-optimize_gpu_memory()
+try:
+    # 1. First load DPT model (smallest) on GPU 0
+    print("Loading DPT model on GPU 0...")
+    dpt_model, transform = initialize_dpt_model(model_path='/home/ec2-user/SageMaker/model_weights/dpt_large-midas-2f21e586.pt', device=dpt_device)
+    optimize_gpu_memory()
+    print("DPT model loaded successfully")
 
-# 2. Load SAM model on GPU 2
-print("Loading SAM model on GPU 2...")
-sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
-sam = sam.to(sam_device)
-predictor = SamPredictor(sam)
-optimize_gpu_memory()
+    # 2. Load SAM model on GPU 2
+    print("Loading SAM model on GPU 2...")
+    sam = sam_model_registry["vit_h"](checkpoint="/home/ec2-user/SageMaker/model_weights/sam_vit_h_4b8939.pth")
+    sam = sam.to(sam_device)
+    predictor = SamPredictor(sam)
+    optimize_gpu_memory()
+    print("SAM model loaded successfully")
 
-# 3. Load Control Net on Multiple GPUs with special handling
-print("Loading ControlNet in chunks onto GPUs 0,1,2...")
+    # 3. Load Control Net on Multiple GPUs with special handling
+    print("Loading ControlNet in chunks onto GPUs 0,1,2...")
 
-# Load state dict separately to control memory usage
-config = OmegaConf.load('./configs/inference.yaml')
-model_ckpt = config.pretrained_model
-model_config = config.config_file
+    # Load state dict separately to control memory usage
+    config = OmegaConf.load('./configs/inference.yaml')
+    model_ckpt = config.pretrained_model
+    model_config = config.config_file
 
-# Create model on CPU first
-model = create_model(model_config).cpu()
-
-# Load the model weights in a memory-efficient way
-print("Loading model state dict from disk...")
-state_dict = load_state_dict(model_ckpt, location="cpu")
-optimize_gpu_memory()
-
-# Load the model weights in smaller chunks
-print("Loading model weights in chunks...")
-keys = list(state_dict.keys())
-chunk_size = len(keys) // 4  # Split into 4 chunks
-
-for i in range(0, len(keys), chunk_size):
-    chunk_keys = keys[i:i+chunk_size]
-    chunk_dict = {k: state_dict[k] for k in chunk_keys}
-    # Load partial state dict
-    model.load_state_dict(chunk_dict, strict=False)
-    # Free memory after each chunk
-    del chunk_dict
+    # Create model on CPU first
+    print("Creating model on CPU...")
+    model = create_model(model_config).cpu()
     optimize_gpu_memory()
 
-# Free memory after loading the full state dict
-del state_dict
-optimize_gpu_memory()
+    # Load the model weights in a memory-efficient way
+    print("Loading model state dict from disk...")
+    state_dict = load_state_dict(model_ckpt, location="cpu")
+    optimize_gpu_memory()
+    print(f"State dict loaded with {len(state_dict.keys())} keys")
 
-# Enable memory-saving features
-print("Enabling memory optimization features...")
-model.half()  # Use half precision
-if hasattr(model, 'enable_gradient_checkpointing'):
-    model.enable_gradient_checkpointing()
+    # Load the model weights in smaller chunks
+    print("Loading model weights in chunks...")
+    keys = list(state_dict.keys())
+    chunk_size = max(1, len(keys) // 8)  # Split into smaller chunks
+    print(f"Processing in chunks of {chunk_size} keys")
 
-# Enable sliced attention for memory efficiency
-enable_sliced_attention()
+    for i in range(0, len(keys), chunk_size):
+        end_idx = min(i+chunk_size, len(keys))
+        print(f"Loading chunk {i//chunk_size + 1} of {(len(keys) + chunk_size - 1)//chunk_size} ({i} to {end_idx})")
+        chunk_keys = keys[i:end_idx]
+        chunk_dict = {k: state_dict[k] for k in chunk_keys}
+        # Load partial state dict
+        model.load_state_dict(chunk_dict, strict=False)
+        # Free memory after each chunk
+        del chunk_dict
+        optimize_gpu_memory()
 
-# Use model parallelism across GPUs
-print("Distributing model across GPUs...")
-device_ids = [0, 1, 2]  # Use GPUs 0, 1, 2 for the model
-model = torch.nn.DataParallel(model, device_ids=device_ids)
-model = model.to(f"cuda:{device_ids[0]}")
+    # Free memory after loading the full state dict
+    del state_dict
+    optimize_gpu_memory()
+    print("State dict fully loaded")
 
-# Create sampler
-ddim_sampler = DDIMSampler(model.module)
-optimize_gpu_memory()
-print("All models loaded successfully!")
+    # Enable memory-saving features
+    print("Enabling memory optimization features...")
+    model.half()  # Use half precision
+    if hasattr(model, 'enable_gradient_checkpointing'):
+        model.enable_gradient_checkpointing()
+        print("Gradient checkpointing enabled")
 
-# Set additional memory optimization flags
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+    # Enable sliced attention for memory efficiency
+    enable_sliced_attention()
+    print("Sliced attention enabled")
+
+    # Use model parallelism across GPUs
+    print("Distributing model across GPUs...")
+    device_ids = [0, 1, 2]  # Use GPUs 0, 1, 2 for the model
+    model = torch.nn.DataParallel(model, device_ids=device_ids)
+    
+    # Move to first GPU in segments
+    print("Moving model to GPU...")
+    model = model.to(f"cuda:{device_ids[0]}")
+    optimize_gpu_memory()
+
+    # Create sampler
+    print("Creating DDIM sampler...")
+    ddim_sampler = DDIMSampler(model.module)
+    optimize_gpu_memory()
+    print("All models loaded successfully!")
+
+    # Set additional memory optimization flags
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+except Exception as e:
+    print(f"Error during model loading: {e}")
+    # Try a more conservative approach if that failed
+    print("Trying alternative loading approach...")
+    optimize_gpu_memory()
+    
+    try:
+        # Clear everything first
+        if 'model' in locals():
+            del model
+        if 'state_dict' in locals():
+            del state_dict
+        if 'chunk_dict' in locals():
+            del chunk_dict
+        optimize_gpu_memory()
+        
+        # Try loading with lower precision from the start
+        print("Creating model with low memory profile...")
+        model = create_model(model_config).half().cpu()
+        
+        # Load directly to target device to avoid CPU memory issues
+        print("Loading directly to GPU 1...")
+        state_dict = load_state_dict(model_ckpt, location="cuda:1")
+        model = model.to("cuda:1")
+        model.load_state_dict(state_dict)
+        del state_dict
+        optimize_gpu_memory()
+        
+        print("Model loaded with alternative method.")
+        # Create sampler
+        ddim_sampler = DDIMSampler(model)
+    except Exception as e2:
+        print(f"Alternative loading also failed: {e2}")
+        # Last resort - try minimal model
+        print("Trying minimal loading approach...")
+        model = create_model(model_config).half().to("cuda:1")
+        model.load_state_dict(load_state_dict(model_ckpt, location="cuda:1"))
+        ddim_sampler = DDIMSampler(model)
+        print("Minimal model loading completed")
 
 def aug_tar_mask(mask, kernal_size=0.001):
     w, h = mask.shape[1], mask.shape[0]
