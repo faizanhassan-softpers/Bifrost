@@ -18,7 +18,7 @@ from cldm.hack import disable_verbosity, enable_sliced_attention
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 
-save_memory = False
+save_memory = True  # Changed to True to enable memory saving features
 disable_verbosity()
 if save_memory:
     enable_sliced_attention()
@@ -32,9 +32,15 @@ if num_gpus < 1:
     device_main = torch.device('cpu')
     device_iseg = torch.device('cpu')
 else:
-    # Assign different GPUs to each model if multiple are available
-    device_main = torch.device(f'cuda:0')  # Main model on first GPU
-    device_iseg = torch.device(f'cuda:{min(1, num_gpus-1)}')  # iseg model on second GPU if available, otherwise first GPU
+    # Use different GPUs if multiple are available
+    device_main = torch.device('cuda:0')  # Main model on first GPU
+    device_iseg = torch.device('cuda:1' if num_gpus > 1 else 'cuda:0')  # iseg model on second GPU if available
+    
+    # Clear GPU memory before loading models
+    torch.cuda.empty_cache()
+    
+    # Set memory allocation to reduce fragmentation
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
 print(f"Using device {device_main} for main model")
 print(f"Using device {device_iseg} for interactive segmentation model")
@@ -44,26 +50,47 @@ model_ckpt = config.pretrained_model
 model_config = config.config_file
 use_interactive_seg = config.config_file
 
+# Custom function to load checkpoint directly to specific device
+def load_checkpoint_to_device(checkpoint_path, target_device):
+    print(f"Loading checkpoint {checkpoint_path} to {target_device}")
+    if target_device.type == 'cuda':
+        # Set current device for loading
+        torch.cuda.set_device(target_device.index)
+    
+    # Load checkpoint to CPU first to avoid OOM
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    return checkpoint
+
 # Load main model on first GPU
+print("Creating base model...")
 model = create_model(model_config).cpu()
-model.load_state_dict(load_state_dict(model_ckpt, location=device_main))
+print("Loading main model checkpoint...")
+checkpoint = load_checkpoint_to_device(model_ckpt, device_main)
 model = model.to(device_main)
+print("Loading model state dict...")
+# custom_load_state_dict = load_state_dict(model_ckpt, location='cpu')
+# model.load_state_dict(custom_load_state_dict)
+model.load_state_dict(checkpoint)
+
 ddim_sampler = DDIMSampler(model)
 
 if use_interactive_seg:
+    print("Loading interactive segmentation model...")
     from iseg.coarse_mask_refine_util import BaselineModel
     model_path = './iseg/coarse_mask_refine.pth'
-    iseg_model = BaselineModel().eval()
-    weights = torch.load(model_path, map_location='cpu')['state_dict']
+    iseg_model = BaselineModel().eval().cpu()  # Initialize on CPU first
+    weights = load_checkpoint_to_device(model_path, device_iseg)['state_dict']
     iseg_model.load_state_dict(weights, strict=True)
     iseg_model = iseg_model.to(device_iseg)
+    print("Interactive segmentation model loaded successfully")
 
 
 def process_image_mask(image_np, mask_np):
-    img = torch.from_numpy(image_np.transpose((2, 0, 1)))
-    img = img.float().div(255).unsqueeze(0).to(device_iseg)
-    mask = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0).to(device_iseg)
-    pred = iseg_model(img, mask)['instances'][0,0].detach().cpu().numpy() > 0.5 
+    with torch.no_grad():
+        img = torch.from_numpy(image_np.transpose((2, 0, 1)))
+        img = img.float().div(255).unsqueeze(0).to(device_iseg)
+        mask = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0).to(device_iseg)
+        pred = iseg_model(img, mask)['instances'][0,0].detach().cpu().numpy() > 0.5 
     return pred.astype(np.uint8)
 
 def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
@@ -97,44 +124,50 @@ def inference_single_image(ref_image,
                            seed,
                            enable_shape_control,
                            ):
+    # Set CUDA device for this inference
+    if device_main.type == 'cuda':
+        torch.cuda.set_device(device_main.index)
+    
     raw_background = tar_image.copy()
     item = process_pairs(ref_image, ref_mask, tar_image, tar_mask, enable_shape_control = enable_shape_control)
 
-    ref = item['ref']
-    hint = item['hint']
-    num_samples = 1
+    with torch.no_grad():
+        ref = item['ref']
+        hint = item['hint']
+        num_samples = 1
 
-    control = torch.from_numpy(hint.copy()).float().to(device_main)
-    control = torch.stack([control for _ in range(num_samples)], dim=0)
-    control = einops.rearrange(control, 'b h w c -> b c h w').clone()
+        control = torch.from_numpy(hint.copy()).float().to(device_main)
+        control = torch.stack([control for _ in range(num_samples)], dim=0)
+        control = einops.rearrange(control, 'b h w c -> b c h w').clone()
 
-    clip_input = torch.from_numpy(ref.copy()).float().to(device_main)
-    clip_input = torch.stack([clip_input for _ in range(num_samples)], dim=0)
-    clip_input = einops.rearrange(clip_input, 'b h w c -> b c h w').clone()
+        clip_input = torch.from_numpy(ref.copy()).float().to(device_main)
+        clip_input = torch.stack([clip_input for _ in range(num_samples)], dim=0)
+        clip_input = einops.rearrange(clip_input, 'b h w c -> b c h w').clone()
 
-    H,W = 512,512
+        H,W = 512,512
 
-    cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
-    zeros = torch.zeros((1,3,224,224), device=device_main)
-    un_cond = {"c_concat": [control], 
-               "c_crossattn": [model.get_learned_conditioning([zeros] * num_samples)]}
-    shape = (4, H // 8, W // 8)
+        cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
+        zeros = torch.zeros((1,3,224,224), device=device_main)
+        un_cond = {"c_concat": [control], 
+                "c_crossattn": [model.get_learned_conditioning([zeros] * num_samples)]}
+        shape = (4, H // 8, W // 8)
 
-    if save_memory:
-        model.low_vram_shift(is_diffusing=True)
+        if save_memory:
+            model.low_vram_shift(is_diffusing=True)
 
-    model.control_scales = ([strength] * 13)
-    samples, _ = ddim_sampler.sample(ddim_steps, num_samples,
-                                     shape, cond, verbose=False, eta=0,
-                                     unconditional_guidance_scale=scale,
-                                     unconditional_conditioning=un_cond)
+        model.control_scales = ([strength] * 13)
+        samples, _ = ddim_sampler.sample(ddim_steps, num_samples,
+                                        shape, cond, verbose=False, eta=0,
+                                        unconditional_guidance_scale=scale,
+                                        unconditional_conditioning=un_cond)
 
-    if save_memory:
-        model.low_vram_shift(is_diffusing=False)
+        if save_memory:
+            model.low_vram_shift(is_diffusing=False)
 
-    x_samples = model.decode_first_stage(samples)
-    x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
+        x_samples = model.decode_first_stage(samples)
+        x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
 
+    # Move back to CPU for image processing
     result = x_samples[0][:,:,::-1]
     result = np.clip(result,0,255)
 
@@ -147,8 +180,12 @@ def inference_single_image(ref_image,
     # keep background unchanged
     y1,y2,x1,x2 = item['tar_box_yyxx']
     raw_background[y1:y2, x1:x2, :] = tar_image[y1:y2, x1:x2, :]
+    
+    # Clear some GPU memory
+    if device_main.type == 'cuda':
+        torch.cuda.empty_cache()
+        
     return raw_background
-
 
 def process_pairs(ref_image, ref_mask, tar_image, tar_mask, max_ratio = 0.8, enable_shape_control = False):
     # ========= Reference ===========
@@ -270,7 +307,10 @@ def run_local(base,
     if mask.sum() == 0:
         raise gr.Error('No mask for the background image.')
 
+    # Set the correct CUDA device when using the iseg model
     if reference_mask_refine:
+        if device_iseg.type == 'cuda':
+            torch.cuda.set_device(device_iseg.index)
         ref_mask = process_image_mask(ref_image, ref_mask)
 
     synthesis = inference_single_image(ref_image.copy(), ref_mask.copy(), image.copy(), mask.copy(), *args)
@@ -279,7 +319,7 @@ def run_local(base,
     return [synthesis]
 
 
-
+# Add GPU memory management options
 with gr.Blocks() as demo:
     with gr.Column():
         gr.Markdown("#  Play with AnyDoor to Teleport your Target Objects! ")
@@ -328,7 +368,7 @@ with gr.Blocks() as demo:
                            outputs=[baseline_gallery]
                         )
 
-# Add memory clearing option
+# Clear memory before launching the app
 if num_gpus > 0:
     torch.cuda.empty_cache()
 
