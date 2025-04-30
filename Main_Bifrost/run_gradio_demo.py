@@ -24,29 +24,75 @@ if save_memory:
     enable_sliced_attention()
 
 
+# Get available GPU count
+num_gpus = torch.cuda.device_count()
+print(f"Number of available GPUs: {num_gpus}")
+
+# Function to get the least busy GPU
+def get_free_gpu():
+    if num_gpus <= 1:
+        return 0
+        
+    free_memory = []
+    for i in range(num_gpus):
+        torch.cuda.set_device(i)
+        reserved = torch.cuda.memory_reserved(i)
+        allocated = torch.cuda.memory_allocated(i)
+        free = torch.cuda.get_device_properties(i).total_memory - allocated
+        free_memory.append(free)
+    
+    return free_memory.index(max(free_memory))
+
 config = OmegaConf.load('./configs/demo.yaml')
 model_ckpt =  config.pretrained_model
 model_config = config.config_file
 use_interactive_seg = config.config_file
 
-model = create_model(model_config ).cpu()
-model.load_state_dict(load_state_dict(model_ckpt, location='cuda'))
-model = model.cuda()
+# Create model on CPU first
+model = create_model(model_config).cpu()
+model.load_state_dict(load_state_dict(model_ckpt, location='cpu'))
+
+# Move model to GPU(s)
+if num_gpus > 1:
+    # Use DataParallel for multiple GPUs
+    model = torch.nn.DataParallel(model)
+    model = model.cuda()
+    print(f"Using DataParallel across {num_gpus} GPUs")
+else:
+    # Use single GPU
+    device_id = get_free_gpu()
+    torch.cuda.set_device(device_id)
+    model = model.cuda()
+    print(f"Using single GPU: {device_id}")
+
 ddim_sampler = DDIMSampler(model)
 
+# Load the interactive segmentation model if needed
 if use_interactive_seg:
     from iseg.coarse_mask_refine_util import BaselineModel
     model_path = './iseg/coarse_mask_refine.pth'
     iseg_model = BaselineModel().eval()
-    weights = torch.load(model_path , map_location='cpu')['state_dict']
-    iseg_model.load_state_dict(weights, strict= True)
+    weights = torch.load(model_path, map_location='cpu')['state_dict']
+    iseg_model.load_state_dict(weights, strict=True)
+    
+    # Move iseg_model to a free GPU if possible
+    if num_gpus > 0:
+        device_id = get_free_gpu()
+        iseg_model = iseg_model.cuda(device_id)
+        print(f"Interactive segmentation model on GPU: {device_id}")
 
 
 def process_image_mask(image_np, mask_np):
     img = torch.from_numpy(image_np.transpose((2, 0, 1)))
     img = img.float().div(255).unsqueeze(0)
     mask = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
-    pred = iseg_model(img, mask)['instances'][0,0].detach().numpy() > 0.5 
+    
+    # Move tensors to the same device as iseg_model
+    if torch.cuda.is_available():
+        img = img.cuda(iseg_model.device if hasattr(iseg_model, 'device') else 0)
+        mask = mask.cuda(iseg_model.device if hasattr(iseg_model, 'device') else 0)
+    
+    pred = iseg_model(img, mask)['instances'][0,0].detach().cpu().numpy() > 0.5 
     return pred.astype(np.uint8)
 
 def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
@@ -87,35 +133,67 @@ def inference_single_image(ref_image,
     hint = item['hint']
     num_samples = 1
 
-    control = torch.from_numpy(hint.copy()).float().cuda() 
+    # Get the device where the model resides
+    if isinstance(model, torch.nn.DataParallel):
+        model_device = model.device_ids[0]
+    else:
+        model_device = next(model.parameters()).device
+
+    # Move data to the appropriate device
+    control = torch.from_numpy(hint.copy()).float().to(model_device)
     control = torch.stack([control for _ in range(num_samples)], dim=0)
     control = einops.rearrange(control, 'b h w c -> b c h w').clone()
 
-
-    clip_input = torch.from_numpy(ref.copy()).float().cuda() 
+    clip_input = torch.from_numpy(ref.copy()).float().to(model_device)
     clip_input = torch.stack([clip_input for _ in range(num_samples)], dim=0)
     clip_input = einops.rearrange(clip_input, 'b h w c -> b c h w').clone()
 
     H,W = 512,512
 
-    cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning( clip_input )]}
+    # Set random seed if specified
+    if seed != -1:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+    # Get learned conditioning
+    module = model.module if isinstance(model, torch.nn.DataParallel) else model
+    cond = {"c_concat": [control], "c_crossattn": [module.get_learned_conditioning(clip_input)]}
+    zero_input = torch.zeros((1, 3, 224, 224), device=model_device)
     un_cond = {"c_concat": [control], 
-               "c_crossattn": [model.get_learned_conditioning([torch.zeros((1,3,224,224))] * num_samples)]}
+               "c_crossattn": [module.get_learned_conditioning([zero_input] * num_samples)]}
     shape = (4, H // 8, W // 8)
 
     if save_memory:
-        model.low_vram_shift(is_diffusing=True)
+        if isinstance(model, torch.nn.DataParallel):
+            model.module.low_vram_shift(is_diffusing=True)
+        else:
+            model.low_vram_shift(is_diffusing=True)
 
-    model.control_scales = ([strength] * 13)
+    # Set control scales
+    if isinstance(model, torch.nn.DataParallel):
+        model.module.control_scales = ([strength] * 13)
+    else:
+        model.control_scales = ([strength] * 13)
+    
+    # Sample
     samples, _ = ddim_sampler.sample(ddim_steps, num_samples,
                                      shape, cond, verbose=False, eta=0,
                                      unconditional_guidance_scale=scale,
                                      unconditional_conditioning=un_cond)
 
     if save_memory:
-        model.low_vram_shift(is_diffusing=False)
+        if isinstance(model, torch.nn.DataParallel):
+            model.module.low_vram_shift(is_diffusing=False)
+        else:
+            model.low_vram_shift(is_diffusing=False)
 
-    x_samples = model.decode_first_stage(samples)
+    # Decode samples
+    if isinstance(model, torch.nn.DataParallel):
+        x_samples = model.module.decode_first_stage(samples)
+    else:
+        x_samples = model.decode_first_stage(samples)
+    
     x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
 
     result = x_samples[0][:,:,::-1]
@@ -253,6 +331,9 @@ def run_local(base,
     if mask.sum() == 0:
         raise gr.Error('No mask for the background image.')
 
+    # Free up CUDA cache to maximize available memory
+    torch.cuda.empty_cache()
+
     if reference_mask_refine:
         ref_mask = process_image_mask(ref_image, ref_mask)
 
@@ -261,11 +342,20 @@ def run_local(base,
     synthesis = synthesis.permute(1, 2, 0).numpy()
     return [synthesis]
 
-
+# Prepare GPU info display
+gpu_info = ""
+for i in range(num_gpus):
+    props = torch.cuda.get_device_properties(i)
+    gpu_info += f"GPU {i}: {props.name}, {props.total_memory / 1024**3:.1f} GB VRAM\n"
 
 with gr.Blocks() as demo:
     with gr.Column():
         gr.Markdown("#  Play with AnyDoor to Teleport your Target Objects! ")
+        
+        # Display GPU information
+        if num_gpus > 0:
+            gr.Markdown(f"### Running on {num_gpus} GPU(s):\n{gpu_info}")
+            
         with gr.Row():
             baseline_gallery = gr.Gallery(label='Output', show_label=True, elem_id="gallery", columns=1, height=768)
             with gr.Accordion("Advanced Option", open=True):
@@ -311,4 +401,5 @@ with gr.Blocks() as demo:
                            outputs=[baseline_gallery]
                         )
 
+# Add additional options for server launch
 demo.launch(server_name="0.0.0.0")
