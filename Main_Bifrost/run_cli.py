@@ -103,7 +103,7 @@ def crop_back(pred, tar_image, extra_sizes, tar_box_yyxx_crop):
     return tar_image
 
 def inference_single_image(model, ddim_sampler, ref_image, ref_mask, tar_image, tar_mask, 
-                           strength, ddim_steps, scale, seed, enable_shape_control):
+                           strength, ddim_steps, scale, seed, enable_shape_control, model_type=None):
     # Ensure we're using the main model's GPU
     torch.cuda.set_device(device_model.index)
     
@@ -135,10 +135,57 @@ def inference_single_image(model, ddim_sampler, ref_image, ref_mask, tar_image, 
     # Create empty tensor on the same device for conditioning
     empty_tensor = torch.zeros((1,3,224,224), device=device_model)
     
-    # Set up conditioning
-    cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
-    un_cond = {"c_concat": [control], 
-               "c_crossattn": [model.get_learned_conditioning(empty_tensor * num_samples)]}
+    # Check if model type is provided through args
+    is_bifrost_model = False
+    if model_type == "bifrost":
+        is_bifrost_model = True
+        print("Using Bifrost model type specified by user")
+    elif model_type == "standard":
+        is_bifrost_model = False
+        print("Using standard model type specified by user")
+    else:
+        # Auto-detect model type
+        try:
+            # Check model config file name as a hint
+            config_path = os.path.basename(model_config).lower() if 'model_config' in locals() else ""
+            if 'bifrost' in config_path:
+                is_bifrost_model = True
+                print(f"Detected Bifrost model based on config filename: {config_path}")
+        except Exception as e:
+            print(f"Warning when checking model type: {e}")
+            print("Using standard conditioning structure")
+    
+    # Create a depth tensor (all zeros) if needed for Bifrost model
+    depth_tensor = None
+    if is_bifrost_model:
+        print("Creating depth tensor for Bifrost model")
+        depth_tensor = torch.zeros((num_samples, 3, H, W), device=device_model)
+    
+    # Set up conditioning based on detected model type
+    if is_bifrost_model:
+        print("Using Bifrost conditioning structure with detail and depth")
+        cond = {
+            "c_concat_detail": [control],
+            "c_concat_depth": [depth_tensor], 
+            "c_crossattn": [model.get_learned_conditioning(clip_input)]
+        }
+        un_cond = {
+            "c_concat_detail": [control],
+            "c_concat_depth": [depth_tensor],
+            "c_crossattn": [model.get_learned_conditioning(empty_tensor)]
+        }
+    else:
+        # For standard ControlNet models
+        print("Using standard ControlNet conditioning structure")
+        cond = {
+            "c_concat": [control], 
+            "c_crossattn": [model.get_learned_conditioning(clip_input)]
+        }
+        un_cond = {
+            "c_concat": [control], 
+            "c_crossattn": [model.get_learned_conditioning(empty_tensor)]
+        }
+    
     shape = (4, H // 8, W // 8)
 
     if save_memory:
@@ -282,6 +329,7 @@ def main():
     parser.add_argument("--shape-control", action="store_true", help="Enable shape control")
     parser.add_argument("--refine-mask", action="store_true", help="Enable reference mask refinement")
     parser.add_argument("--config", type=str, default="./configs/demo.yaml", help="Path to config file")
+    parser.add_argument("--model-type", type=str, choices=["bifrost", "standard"], help="Force model type (bifrost or standard)")
     
     args = parser.parse_args()
     
@@ -407,7 +455,8 @@ def main():
         args.steps, 
         args.scale, 
         args.seed,
-        args.shape_control
+        args.shape_control,
+        args.model_type
     )
     
     # Save result
