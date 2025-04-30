@@ -14,42 +14,103 @@ from cldm.ddim_hacked import DDIMSampler
 from omegaconf import OmegaConf
 from cldm.hack import disable_verbosity, enable_sliced_attention
 
+# Check available GPUs
+num_gpus = torch.cuda.device_count()
+print(f"Number of available GPUs: {num_gpus}")
+
+# Use all available GPUs
+gpu_ids = list(range(num_gpus))
+gpu_ids_str = ','.join(map(str, gpu_ids))
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
+print(f"Using GPUs: {gpu_ids_str}")
 
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 
-save_memory = False
+# Enable memory saving for all operations
+save_memory = True
 disable_verbosity()
 if save_memory:
     enable_sliced_attention()
 
+# Configure device allocation based on available GPUs
+if num_gpus >= 2:
+    # Multi-GPU setup
+    # Interactive segmentation is smallest, put on GPU 0
+    device_iseg = torch.device("cuda:0")
+    # Main model is largest, put on remaining GPU with most memory
+    device_model = torch.device("cuda:1")
+else:
+    # Only 1 GPU - need to use more aggressive memory management
+    device_iseg = torch.device("cuda:0")
+    device_model = torch.device("cuda:0")
+
+print(f"Interactive segmentation on {device_iseg}, Main model on {device_model}")
+
+# Enable memory tracking for debugging
+if torch.cuda.is_available():
+    for i in range(num_gpus):
+        print(f"GPU {i} memory: {torch.cuda.memory_allocated(i)/(1024**2):.2f}MB / {torch.cuda.get_device_properties(i).total_memory/(1024**2):.2f}MB")
+
+# Recursively move an entire model to the device
+def move_to_device(model, device):
+    if hasattr(model, 'to'):
+        model = model.to(device)
+    
+    # Recursively move internal models
+    for attr_name in dir(model):
+        try:
+            attr = getattr(model, attr_name)
+            if isinstance(attr, torch.nn.Module):
+                setattr(model, attr_name, move_to_device(attr, device))
+            elif attr_name == 'model' and hasattr(attr, 'to'):
+                setattr(model, attr_name, attr.to(device))
+        except: 
+            pass
+    return model
 
 config = OmegaConf.load('./configs/demo.yaml')
-model_ckpt =  config.pretrained_model
+model_ckpt = config.pretrained_model
 model_config = config.config_file
 use_interactive_seg = config.config_file
 
-model = create_model(model_config ).cpu()
-model.load_state_dict(load_state_dict(model_ckpt, location='cuda'))
-model = model.cuda()
+# Create and load main model on appropriate GPU
+torch.cuda.set_device(device_model.index)
+torch.cuda.empty_cache()
+print(f"Loading main model from {model_ckpt} to {device_model}")
+model = create_model(model_config).cpu()
+model.load_state_dict(load_state_dict(model_ckpt, location='cpu'))
+model = model.to(device_model)
 ddim_sampler = DDIMSampler(model)
+print(f"Main model loaded on {device_model}, memory: {torch.cuda.memory_allocated(device_model.index)/(1024**2):.2f}MB")
 
+# Load interactive segmentation model if needed
 if use_interactive_seg:
+    torch.cuda.set_device(device_iseg.index)
+    torch.cuda.empty_cache()
     from iseg.coarse_mask_refine_util import BaselineModel
     model_path = './iseg/coarse_mask_refine.pth'
     iseg_model = BaselineModel().eval()
-    weights = torch.load(model_path , map_location='cpu')['state_dict']
-    iseg_model.load_state_dict(weights, strict= True)
+    weights = torch.load(model_path, map_location='cpu')['state_dict']
+    iseg_model.load_state_dict(weights, strict=True)
+    iseg_model = iseg_model.to(device_iseg)
+    print(f"Interactive segmentation model loaded on {device_iseg}, memory: {torch.cuda.memory_allocated(device_iseg.index)/(1024**2):.2f}MB")
 
 
 def process_image_mask(image_np, mask_np):
+    # Ensure we're using the interactive segmentation model's GPU
+    torch.cuda.set_device(device_iseg.index)
+    
     img = torch.from_numpy(image_np.transpose((2, 0, 1)))
-    img = img.float().div(255).unsqueeze(0)
-    mask = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
-    pred = iseg_model(img, mask)['instances'][0,0].detach().numpy() > 0.5 
+    img = img.float().div(255).unsqueeze(0).to(device_iseg)
+    mask = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0).to(device_iseg)
+    
+    with torch.no_grad():
+        pred = iseg_model(img, mask)['instances'][0,0].detach().cpu().numpy() > 0.5 
+    
     return pred.astype(np.uint8)
 
-def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
+def crop_back(pred, tar_image, extra_sizes, tar_box_yyxx_crop):
     H1, W1, H2, W2 = extra_sizes
     y1,y2,x1,x2 = tar_box_yyxx_crop    
     pred = cv2.resize(pred, (W2, H2))
@@ -80,43 +141,56 @@ def inference_single_image(ref_image,
                            seed,
                            enable_shape_control,
                            ):
+    # Ensure we're using the main model's GPU
+    torch.cuda.set_device(device_model.index)
+    
     raw_background = tar_image.copy()
-    item = process_pairs(ref_image, ref_mask, tar_image, tar_mask, enable_shape_control = enable_shape_control)
+    item = process_pairs(ref_image, ref_mask, tar_image, tar_mask, enable_shape_control=enable_shape_control)
 
     ref = item['ref']
     hint = item['hint']
     num_samples = 1
 
-    control = torch.from_numpy(hint.copy()).float().cuda() 
+    # Move tensors to the correct device
+    control = torch.from_numpy(hint.copy()).float().to(device_model)
     control = torch.stack([control for _ in range(num_samples)], dim=0)
     control = einops.rearrange(control, 'b h w c -> b c h w').clone()
 
-
-    clip_input = torch.from_numpy(ref.copy()).float().cuda() 
+    clip_input = torch.from_numpy(ref.copy()).float().to(device_model)
     clip_input = torch.stack([clip_input for _ in range(num_samples)], dim=0)
     clip_input = einops.rearrange(clip_input, 'b h w c -> b c h w').clone()
 
     H,W = 512,512
 
-    cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning( clip_input )]}
+    # Create empty tensor on the same device for conditioning
+    empty_tensor = torch.zeros((1,3,224,224), device=device_model)
+    
+    # Set up conditioning
+    cond = {"c_concat": [control], "c_crossattn": [model.get_learned_conditioning(clip_input)]}
     un_cond = {"c_concat": [control], 
-               "c_crossattn": [model.get_learned_conditioning([torch.zeros((1,3,224,224))] * num_samples)]}
+               "c_crossattn": [model.get_learned_conditioning(empty_tensor * num_samples)]}
     shape = (4, H // 8, W // 8)
 
     if save_memory:
         model.low_vram_shift(is_diffusing=True)
 
     model.control_scales = ([strength] * 13)
-    samples, _ = ddim_sampler.sample(ddim_steps, num_samples,
-                                     shape, cond, verbose=False, eta=0,
-                                     unconditional_guidance_scale=scale,
-                                     unconditional_conditioning=un_cond)
+    
+    # Use mixed precision to save memory
+    with torch.cuda.amp.autocast(enabled=save_memory):
+        samples, _ = ddim_sampler.sample(ddim_steps, num_samples,
+                                        shape, cond, verbose=False, eta=0,
+                                        unconditional_guidance_scale=scale,
+                                        unconditional_conditioning=un_cond)
 
     if save_memory:
         model.low_vram_shift(is_diffusing=False)
 
     x_samples = model.decode_first_stage(samples)
     x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()
+
+    # Clear CUDA cache
+    torch.cuda.empty_cache()
 
     result = x_samples[0][:,:,::-1]
     result = np.clip(result,0,255)
