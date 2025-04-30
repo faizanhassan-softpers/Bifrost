@@ -466,9 +466,29 @@ def main():
     output_dir = os.path.dirname(args.output)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-        
-    cv2.imwrite(args.output, result_bgr)
-    print(f"Result saved to {args.output}")
+    
+    # Ensure output file has a valid image extension
+    output_path = args.output
+    valid_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+    file_ext = os.path.splitext(output_path)[1].lower()
+    
+    if not file_ext or file_ext not in valid_extensions:
+        # If no valid extension, add .jpg
+        output_path = f"{output_path}.jpg"
+        print(f"No valid image extension detected, using {output_path}")
+    
+    # Save the image
+    success = cv2.imwrite(output_path, result_bgr)
+    if success:
+        print(f"Result saved to {output_path}")
+    else:
+        # Try with a different format if saving failed
+        output_path_fallback = f"{os.path.splitext(output_path)[0]}.png"
+        success = cv2.imwrite(output_path_fallback, result_bgr)
+        if success:
+            print(f"Failed with original format, result saved to {output_path_fallback}")
+        else:
+            print(f"Error: Could not save the result image. Please check file permissions and path.")
     
     # Clean up
     torch.cuda.empty_cache()
