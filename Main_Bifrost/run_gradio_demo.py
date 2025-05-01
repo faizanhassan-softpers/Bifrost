@@ -372,4 +372,5 @@ with gr.Blocks() as demo:
 if num_gpus > 0:
     torch.cuda.empty_cache()
 
-demo.launch(server_name="0.0.0.0")
+#demo.launch(server_name="0.0.0.0")
+demo.launch(share=True)
