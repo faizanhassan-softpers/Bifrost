@@ -1,3 +1,30 @@
+# installation Steps
+mkdir dev && cd dev
+
+git clone https://github.com/faizanhassan-softpers/Bifrost.git
+
+conda env create -f environment.yaml
+
+source ~/.bashrc 
+
+conda activate bifrost
+
+
+// install in EBS
+// repo: https://huggingface.co/kunkaran/sam_vit_h_4b8939.pth/tree/main
+wget https://huggingface.co/kunkaran/sam_vit_h_4b8939.pth/resolve/main/sam_vt_h.pth
+
+// repo: https://huggingface.co/damaimai/dpt_large-midas-2f21e586.pt/tree/main
+wget https://huggingface.co/damaimai/dpt_large-midas-2f21e586.pt/resolve/main/dpt_large-midas-2f21e586.pt
+
+// repo: https://huggingface.co/Dominoc/dinov2_vitg14/tree/main
+wget https://huggingface.co/Dominoc/dinov2_vitg14/resolve/main/dinov2_vitg14_pretrain.pth
+
+// repo: https://huggingface.co/lingxiao2049/Bifrost/tree/main
+wget https://huggingface.co/lingxiao2049/Bifrost/resolve/main/bifrost.ckpt
+
+----------------------------------------------------------------------------------------------------------------
+
 # BIFRÖST: 3D-Aware Image compositing with Language Instructions
 <div align="center">
 
