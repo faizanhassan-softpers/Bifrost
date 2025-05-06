@@ -429,7 +429,8 @@ def process_images_at_runtime(object_image_path, background_image_path,
     # Define paths for intermediate files
     ref_image_mask_path = os.path.join(mask_dir, f"{os.path.splitext(object_filename)[0]}_mask.jpg")
     bg_mask_path = os.path.join(mask_dir, f"{os.path.splitext(bg_filename)[0]}_mask.png")
-    ref_image_depth_path = os.path.join(depth_dir, f"{os.path.splitext(object_filename)[0]}.png")
+    ref_image_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/object_mask.jpg'
+    # ref_image_depth_path = os.path.join(depth_dir, f"{os.path.splitext(object_filename)[0]}.png")
     bg_image_depth_path = os.path.join(depth_dir, f"{os.path.splitext(bg_filename)[0]}.png")
     fused_depth_path = os.path.join(depth_dir, "fused_depth.png")
     fused_mask_path = os.path.join(mask_dir, "fused_mask.png")
