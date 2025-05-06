@@ -311,4 +311,5 @@ with gr.Blocks() as demo:
                            outputs=[baseline_gallery]
                         )
 
-demo.launch(server_name="0.0.0.0")
+# demo.launch(server_name="0.0.0.0")
+demo.launch(share=True)
