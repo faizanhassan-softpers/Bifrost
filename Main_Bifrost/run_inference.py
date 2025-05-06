@@ -453,11 +453,12 @@ if __name__ == '__main__':
     predictor.set_image(image)
     point_coords = np.array([[h*ref_object_location[1], w*ref_object_location[0]]])
     point_labels = np.array([1])
-    masks, _, _ = predictor.predict(point_coords=point_coords,
+    masks, mask_scores, _ = predictor.predict(point_coords=point_coords,
                                     point_labels=point_labels,
                                     multimask_output=True)
     # save the mask image
-    mask = masks[1].astype(np.uint8)
+    best_mask_index = np.argmax(mask_scores)
+    mask = masks[best_mask_index].astype(np.uint8)
     # cv2.imwrite(ref_image_mask_path, mask)
     cv2.imwrite(ref_image_mask_path, mask)
     mask = cv2.imread(ref_image_mask_path, cv2.IMREAD_UNCHANGED)
