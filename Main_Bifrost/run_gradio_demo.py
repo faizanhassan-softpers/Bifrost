@@ -220,8 +220,8 @@ def process_pairs(ref_image, ref_mask, tar_image, tar_mask, max_ratio = 0.8, ena
     return item
 
 
-ref_dir='./examples/Gradio/FG'
-image_dir='./examples/Gradio/BG'
+ref_dir='./examples/TEST/Input'
+image_dir='./examples/TEST/Input'
 ref_list=[os.path.join(ref_dir,file) for file in os.listdir(ref_dir) if '.jpg' in file or '.png' in file or '.jpeg' in file ]
 ref_list.sort()
 image_list=[os.path.join(image_dir,file) for file in os.listdir(image_dir) if '.jpg' in file or '.png' in file or '.jpeg' in file]
