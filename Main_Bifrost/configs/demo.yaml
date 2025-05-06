@@ -1,4 +1,4 @@
-pretrained_model: path/epoch=1-step=8687.ckpt
+pretrained_model: /home/ec2-user/SageMaker/model_weights/bifrost.ckpt
 config_file: configs/bifrost.yaml
 save_memory: False
 use_interactive_seg: True
