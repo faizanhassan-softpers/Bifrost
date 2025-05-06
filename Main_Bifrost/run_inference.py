@@ -488,8 +488,8 @@ if __name__ == '__main__':
 
 
     # read the depth map predicted by DPT
-    back_depth = cv2.imread(f'{output_depth_folder}/{os.path.splitext(ref_image_name)[0]}.png', cv2.IMREAD_UNCHANGED)
-    ref_depth = cv2.imread(f'{output_depth_folder}/{os.path.splitext(bg_image_name)[0]}.png', cv2.IMREAD_UNCHANGED)
+    back_depth = cv2.imread(f'{output_depth_folder}/{os.path.splitext(bg_image_name)[0]}.png', cv2.IMREAD_UNCHANGED)
+    ref_depth = cv2.imread(f'{output_depth_folder}/{os.path.splitext(ref_image_name)[0]}.png', cv2.IMREAD_UNCHANGED)
     ref_depth = ref_depth*ref_mask
     if flip_image:
         ref_depth = cv2.flip(ref_depth, 1)
