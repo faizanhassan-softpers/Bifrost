@@ -388,9 +388,13 @@ if __name__ == '__main__':
 
     # fused_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/fused_depth.png'
     # fused_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/fused_mask.png'
+    fused_depth_path = f"{temp_dir_path}/fused_depth_{bg_image_name}"
+    fused_mask_path = f"{temp_dir_path}/fused_mask_{bg_image_name}"
 
     # save_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res.png'
     # save_compose_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res_compose.png'
+    save_path = f"{temp_dir_path}/gen_res_{ref_image_name}"
+    save_compose_path = f"{temp_dir_path}/gen_res_compose_{ref_image_name}"
 
     input_folder = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input'
     output_depth_folder = f"{temp_dir_path}/DEPTH"
