@@ -477,8 +477,8 @@ if __name__ == '__main__':
 
 
     # read the depth map predicted by DPT
-    back_depth = cv2.imread('/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth/background.png', cv2.IMREAD_UNCHANGED)
-    ref_depth = cv2.imread('/home/mhf/dxl/Lingxiao/Codes/BIFROST/examples/TEST/Depth/object.png', cv2.IMREAD_UNCHANGED)
+    back_depth = cv2.imread('./examples/TEST/Depth/background.png', cv2.IMREAD_UNCHANGED)
+    ref_depth = cv2.imread('./examples/TEST/Depth/object.png', cv2.IMREAD_UNCHANGED)
     ref_depth = ref_depth*ref_mask
     if flip_image:
         ref_depth = cv2.flip(ref_depth, 1)
