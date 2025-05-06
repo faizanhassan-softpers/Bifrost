@@ -368,23 +368,33 @@ def depth_mask_fusion(back_depth, ref_depth, back_mask, ref_mask, depth_scale=[0
 
 
 if __name__ == '__main__': 
+    temp_dir_path = './examples/temp'
+
     # ==== Example for inferring a single image ===
     ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'
-    ref_image_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/object_mask.jpg'
-    ref_image_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/object.png'
+    ref_image_name = os.path.basename(ref_image_path)
+    ref_image_mask_path = f"{temp_dir_path}/mask_{ref_image_name}"
+
+
+    # ref_image_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/object_mask.jpg'
+    # ref_image_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/object.png'
 
     bg_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/background.jpg'
-    bg_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/background_mask.png'
-    bg_image_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/Test/Depth/background.png'
+    bg_image_name = os.path.basename(bg_image_path)
+    bg_mask_path = f"{temp_dir_path}/mask_{bg_image_name}"
 
-    fused_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/fused_depth.png'
-    fused_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/fused_mask.png'
+    # bg_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/background_mask.png'
+    # bg_image_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/Test/Depth/background.png'
 
-    save_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res.png'
-    save_compose_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res_compose.png'
+    # fused_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/fused_depth.png'
+    # fused_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/fused_mask.png'
+
+    # save_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res.png'
+    # save_compose_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res_compose.png'
 
     input_folder = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input'
-    output_folder = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth'
+    output_depth_folder = f"{temp_dir_path}/DEPTH"
+    # output_folder = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth'
     # [x, y, w, h] in the range of [0, 1]
     bg_mask = [0.338, 0.521, 0.2, 0.32]
     ref_object_location = [0.5, 0.45] # [x, y] in the range of [0, 1]
@@ -445,10 +455,11 @@ if __name__ == '__main__':
     # save the mask image
     mask = masks[1].astype(np.uint8)
     # cv2.imwrite(ref_image_mask_path, mask)
+    cv2.imwrite(ref_image_mask_path, mask)
     mask = cv2.imread(ref_image_mask_path, cv2.IMREAD_UNCHANGED)
     ref_mask = (mask[:, :] > 0).astype(np.uint8)
     ref_image = image
-    if mode == 'draw':
+    if mode == 'draw' or True:
         h_back, w_back = back_image.shape[0], back_image.shape[1]
         # Use SAM to predict the mask for background image
         predictor.set_image(back_image)
@@ -459,10 +470,10 @@ if __name__ == '__main__':
                                         multimask_output=True)
         # save the mask image
         back_mask = masks[1].astype(np.uint8)
-        # cv2.imwrite(bg_mask_path, back_mask)
+        cv2.imwrite(bg_mask_path, back_mask)
 
     # Get the depth map using DPT
-    run(dpt_model, transform, input_folder, output_folder)
+    run(dpt_model, transform, input_folder, output_depth_folder)
 
 
     # transform reference image style to the background image style
@@ -477,8 +488,8 @@ if __name__ == '__main__':
 
 
     # read the depth map predicted by DPT
-    back_depth = cv2.imread('./examples/TEST/Depth/background.png', cv2.IMREAD_UNCHANGED)
-    ref_depth = cv2.imread('./examples/TEST/Depth/object.png', cv2.IMREAD_UNCHANGED)
+    back_depth = cv2.imread(f'{output_depth_folder}/{os.path.splitext(ref_image_name)[0]}.png', cv2.IMREAD_UNCHANGED)
+    ref_depth = cv2.imread(f'{output_depth_folder}/{os.path.splitext(bg_image_name)[0]}.png', cv2.IMREAD_UNCHANGED)
     ref_depth = ref_depth*ref_mask
     if flip_image:
         ref_depth = cv2.flip(ref_depth, 1)
