@@ -134,6 +134,7 @@ def eval_model(args):
     print(outputs)
     end_time = time.time()
     print("Time taken: ", end_time - start_time)
+    return outputs
 
 
 if __name__ == "__main__":
