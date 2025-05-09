@@ -42,7 +42,7 @@ def get_bbox_coordinates(bbox_data):
         if x + width > 1 or y + height > 1:
             return f"Error: Box {i} coordinates are out of range [0,1]"
             
-        result += f"\nBox {i}: [x={x:.2f}, y={y:.2f}, width={width:.2f}, height={height:.2f}], label={label}\n"
+        result += f"\nBox {i}: [{x:.2f}, {y:.2f}, {width:.2f}, {height:.2f}], label={label}\n"
     return result
 
 
