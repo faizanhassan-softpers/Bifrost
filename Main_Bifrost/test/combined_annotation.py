@@ -2,6 +2,10 @@ import gradio as gr
 import numpy as np
 from PIL import Image, ImageDraw
 from gradio_image_annotation import image_annotator
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from run_inference_lib import run_inference
 
 def create_blank_image(width=500, height=400):
     """Create a blank white image."""
@@ -90,6 +94,46 @@ def process_annotations(image, points, annotations):
     
     return img, output_text
 
+def run_inference_with_annotations(image, points, annotations):
+    """Run inference using the annotated points and boxes."""
+    if image is None or not annotations or "boxes" not in annotations:
+        return None, "Missing required annotations"
+    
+    # Get the background image path
+    bg_image_path = image.filename if hasattr(image, 'filename') else None
+    if not bg_image_path:
+        return None, "Background image path not found"
+    
+    # Get the reference object location from points
+    # Convert points to normalized coordinates [x, y]
+    image_width, image_height = image.size
+    ref_object_location = [[round(x / image_width, 3), round(y / image_height, 3)] for x, y in points]
+    
+    # Get the background mask from the bounding box
+    boxes = get_boxes_json(annotations)
+    if not boxes:
+        return None, "No bounding box found"
+    bg_mask = boxes[0]  # Use the first box as the background mask
+    
+    # Create temp directory if it doesn't exist
+    temp_dir_path = os.path.join(os.path.dirname(bg_image_path), 'temp')
+    os.makedirs(temp_dir_path, exist_ok=True)
+    
+    try:
+        # Run inference
+        gen_image = run_inference(
+            temp_dir_path=temp_dir_path,
+            bg_image_path=bg_image_path,
+            bg_mask=bg_mask,
+            ref_object_location=ref_object_location
+        )
+        
+        # Convert numpy array to PIL Image
+        result_image = Image.fromarray(gen_image)
+        return result_image, "Generation complete!"
+    except Exception as e:
+        return None, f"Error during inference: {str(e)}"
+
 # Create the Gradio interface
 with gr.Blocks(css="""
 .annotation-panel {
@@ -151,14 +195,24 @@ with gr.Blocks(css="""
     # Process button and combined output
     with gr.Row(elem_classes=["centered-row"]):
         process_btn = gr.Button("Process", variant="primary", elem_classes=["centered-btn"])
+        generate_btn = gr.Button("Generate", variant="primary", elem_classes=["centered-btn"])
+    
     with gr.Row(elem_classes=["centered-row"]):
         combined_json = gr.JSON(label="Combined Coordinates", elem_classes=["centered-json"])
+        result_image = gr.Image(label="Generated Image", elem_classes=["centered-json"])
     
     # Handle process button click
     process_btn.click(
         process_annotations,
         inputs=[input_image, points, annotator],
         outputs=[input_image, combined_json]
+    )
+    
+    # Handle generate button click
+    generate_btn.click(
+        run_inference_with_annotations,
+        inputs=[input_image, points, annotator],
+        outputs=[result_image, gr.Textbox(label="Status")]
     )
 
 if __name__ == "__main__":
