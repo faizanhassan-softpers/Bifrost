@@ -451,8 +451,9 @@ if __name__ == '__main__':
     '''
     # Use SAM to predict the mask for reference image
     predictor.set_image(image)
-    point_coords = np.array([[h*ref_object_location[1], w*ref_object_location[0]]])
-    point_labels = np.array([1])
+    # point_coords = np.array([[h*ref_object_location[1], w*ref_object_location[0]]])
+    point_coords = np.array([[h*loc[1], w*loc[0]] for loc in ref_object_location])
+    point_labels = np.ones(len(ref_object_location))
     masks, mask_scores, _ = predictor.predict(point_coords=point_coords,
                                     point_labels=point_labels,
                                     multimask_output=True)
