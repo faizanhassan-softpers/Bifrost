@@ -367,7 +367,7 @@ def depth_mask_fusion(back_depth, ref_depth, back_mask, ref_mask, depth_scale=[0
     return back_depth, 1-tar_mask, selected_mask
 
 
-def run_inference(temp_dir_path, bg_image_path, bg_mask, ref_object_location, 
+def run_inference(temp_dir_path, bg_image_path, ref_image_path, bg_mask, ref_object_location, 
                  bg_object_location=[0.6, 0.5], depth=[0.1, 0.22], 
                  pixel_num=0.02, mode='place', flip_image=False,
                  sobel_color=False, sobel_threshold=50):
@@ -391,7 +391,7 @@ def run_inference(temp_dir_path, bg_image_path, bg_mask, ref_object_location,
         tuple: (generated_image, composite_image)
     """
     # ==== Example for inferring a single image ===
-    ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'
+    # ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'
     ref_image_name = os.path.basename(ref_image_path)
     ref_image_mask_path = f"{temp_dir_path}/mask_{ref_image_name}"
 

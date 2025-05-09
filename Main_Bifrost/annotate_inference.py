@@ -1,49 +1,29 @@
 import gradio as gr
+from gradio_image_prompter import ImagePrompter
 import numpy as np
 from PIL import Image, ImageDraw
 from gradio_image_annotation import image_annotator
-from run_inference_lib import run_inference
 import os
+import tempfile
+import uuid
 
-def create_blank_image(width=500, height=400):
-    """Create a blank white image."""
-    return Image.new('RGB', (width, height), 'white')
-
-def draw_points(image, points):
-    """Draw points on the image."""
-    # Create a new image if None
-    if image is None:
-        img = create_blank_image()
-    else:
-        # Convert to PIL Image if it's not already
-        if not isinstance(image, Image.Image):
-            img = Image.fromarray(image)
-        else:
-            img = image.copy()
+def scale_points(prompts):
+    image = prompts["image"]
+    points = prompts["points"]
     
-    draw = ImageDraw.Draw(img)
-    
-    # Draw each point
-    for point in points:
-        x, y = point
-        # Draw a small circle at each point
-        draw.ellipse([x-5, y-5, x+5, y+5], fill='red')
-    
-    return img
-
-def on_image_click(image, evt: gr.SelectData, points):
-    """Handle click events on the image."""
-    # Get click coordinates
-    x, y = evt.index
-    
-    # Add new point to the list
-    points.append((x, y))
-    
-    # Draw all points on the image
-    result_image = draw_points(image, points)
-    
-    # Return the image and updated points list
-    return result_image, points
+    if image is not None and points is not None:
+        # Get image dimensions
+        height, width = image.shape[:2]
+        
+        # Scale points
+        scaled_points = []
+        for point in points:
+            x = point[0] / width
+            y = point[1] / height
+            scaled_points.append([round(x, 3), round(y, 3)])
+        
+        return image, scaled_points
+    return image, points
 
 def get_boxes_json(annotations):
     boxes = annotations["boxes"]
@@ -60,19 +40,98 @@ def get_boxes_json(annotations):
     
     return normalized_boxes
 
-def process_annotations(image, points, annotations):
-    """Combine point and bounding box annotations into a single view."""
+def save_uploaded_image(image, prefix="image"):
+    """Save uploaded image to a temporary file and return its path."""
+    print(f"\n=== Debug: {prefix} Saving Process ===")
+    print(f"Image is None: {image is None}")
+    if image is not None:
+        print(f"Image type: {type(image)}")
+        print(f"Image shape/dimensions: {image.shape if hasattr(image, 'shape') else 'N/A'}")
+        
     if image is None:
-        return None, "No image provided"
+        return None
+        
+    # Create directory if it doesn't exist
+    save_dir = "./examples/TEST/Input"
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Convert image to PIL Image if it's not already
-    if not isinstance(image, Image.Image):
-        img = Image.fromarray(image)
+    # Generate random filename
+    random_filename = f"{prefix}_{uuid.uuid4().hex[:8]}.png"
+    save_path = os.path.join(save_dir, random_filename)
+    
+    try:
+        if isinstance(image, np.ndarray):
+            print(f"Saving {prefix} numpy array image")
+            Image.fromarray(image).save(save_path)
+        elif isinstance(image, Image.Image):
+            print(f"Saving {prefix} PIL Image")
+            image.save(save_path)
+        else:
+            print(f"Unknown image type: {type(image)}")
+            return None
+            
+        print(f"Image saved to: {save_path}")
+        print(f"File exists: {os.path.exists(save_path)}")
+        return save_path
+    except Exception as e:
+        print(f"Error saving image: {str(e)}")
+        return None
+    print("===================================\n")
+
+def process_annotations(bg_prompts, ref_prompts, points_df, annotations):
+    """Combine point and bounding box annotations into a single view."""
+    print("\n=== Debug: Checking conditions ===")
+    print(f"bg_prompts is None: {bg_prompts is None}")
+    print(f"ref_prompts is None: {ref_prompts is None}")
+    
+    if bg_prompts is not None:
+        print(f"bg_prompts has image key: {'image' in bg_prompts}")
+        if 'image' in bg_prompts:
+            print(f"Background image type: {type(bg_prompts['image'])}")
+    
+    if ref_prompts is not None:
+        print(f"ref_prompts has image key: {'image' in ref_prompts}")
+        if 'image' in ref_prompts:
+            print(f"Reference image type: {type(ref_prompts['image'])}")
+    
+    if bg_prompts is None or "image" not in bg_prompts:
+        return None, "No background image provided"
+    
+    if ref_prompts is None or "image" not in ref_prompts:
+        return None, "No reference image provided"
+    
+    bg_image = bg_prompts["image"]
+    ref_image = ref_prompts["image"]
+    
+    if bg_image is None:
+        return None, "No background image provided"
+    
+    if ref_image is None:
+        return None, "No reference image provided"
+    
+    # Save both images and get their paths
+    bg_image_path = save_uploaded_image(bg_image, prefix="bg")
+    ref_image_path = save_uploaded_image(ref_image, prefix="ref")
+    print(f"Returned bg_image_path: {bg_image_path}")
+    print(f"Returned ref_image_path: {ref_image_path}")
+    
+    # Convert background image to PIL Image if it's not already
+    if not isinstance(bg_image, Image.Image):
+        img = Image.fromarray(bg_image)
     else:
-        img = image.copy()
+        img = bg_image.copy()
+    
+    # Convert DataFrame to list of points
+    points = []
+    if not points_df.empty:
+        points = points_df.values.tolist()
     
     # Draw points
-    img = draw_points(img, points)
+    if points:
+        draw = ImageDraw.Draw(img)
+        for point in points:
+            x, y = point
+            draw.ellipse([x-5, y-5, x+5, y+5], fill='red')
     
     # Draw bounding boxes
     if annotations and "boxes" in annotations:
@@ -90,115 +149,91 @@ def process_annotations(image, points, annotations):
         "bounding_boxes": get_boxes_json(annotations) if annotations else []
     }
     
-    # Run inference if we have both points and bounding boxes
-    if points and annotations and "boxes" in annotations and len(annotations["boxes"]) > 0:
-        # Hardcoded temp directory
-        temp_dir_path = "./examples/temp"
-        os.makedirs(temp_dir_path, exist_ok=True)
+    # Call run_inference if we have both points and bounding boxes
+    if points and annotations and "boxes" in annotations:
+        # from run_inference_lib import run_inference
         
-        # Get background image path (assuming it's the input image)
-        bg_image_path = "background.jpg"  # You'll need to save the background image first
-        
-        # Get bounding box coordinates
-        box = annotations["boxes"][0]  # Take first box
-        image_height, image_width = annotations["image"].shape[:2]
+        # Get the first bounding box coordinates
+        box = annotations["boxes"][0]
         bg_mask = [
-            box["xmin"] / image_width,
-            box["ymin"] / image_height,
-            (box["xmax"] - box["xmin"]) / image_width,
-            (box["ymax"] - box["ymin"]) / image_height
+            box["xmin"] / bg_image.shape[1],  # x
+            box["ymin"] / bg_image.shape[0],  # y
+            (box["xmax"] - box["xmin"]) / bg_image.shape[1],  # width
+            (box["ymax"] - box["ymin"]) / bg_image.shape[0]   # height
         ]
         
-        # Convert points to normalized coordinates
+        # Get all point coordinates normalized
         ref_object_location = []
         for point in points:
-            x, y = point
-            ref_object_location.append([x / image_width, y / image_height])
+            x = point[0]
+            y = point[1]
+            ref_object_location.append([round(x, 6), round(y, 6)])
         
-        # Run inference
-        gen_image, vis_image = run_inference(
-            temp_dir_path=temp_dir_path,
-            bg_image_path=bg_image_path,
-            bg_mask=bg_mask,
-            ref_object_location=ref_object_location
-        )
+        # Run inference with static temp directory
+        temp_dir_path = "./examples/temp"
         
-        if gen_image is not None:
-            # Convert numpy array to PIL Image
-            gen_image_pil = Image.fromarray(gen_image)
-            return gen_image_pil, output_text
+        print("\n=== Values being passed to run_inference ===")
+        print(f"temp_dir_path: {temp_dir_path}")
+        print(f"bg_image_path: {bg_image_path}")
+        print(f"ref_image_path: {ref_image_path}")
+        print(f"bg_mask: {bg_mask}")
+        print(f"ref_object_location: {ref_object_location}")
+        print("===========================================\n")
+        
+        # Commenting out the actual function call for now
+        # gen_image, vis_image = run_inference(
+        #     temp_dir_path=temp_dir_path,
+        #     bg_image_path=bg_image_path,
+        #     ref_image_path=ref_image_path,
+        #     bg_mask=bg_mask,
+        #     ref_object_location=ref_object_location
+        # )
+        # return img, output_text, gen_image, vis_image
+        
+        # For testing, return dummy images
+        dummy_image = np.zeros((512, 512, 3), dtype=np.uint8)
+        return img, output_text, dummy_image, dummy_image
     
-    return img, output_text
+    # Return dummy images when no inference is performed
+    dummy_image = np.zeros((512, 512, 3), dtype=np.uint8)
+    return img, output_text, dummy_image, dummy_image
 
 # Create the Gradio interface
-with gr.Blocks(css="""
-.annotation-panel {
-    background: #181a20;
-    border-radius: 10px;
-    padding: 18px 12px 12px 12px;
-    margin: 0 32px;
-    border: 1px solid #23262f;
-    min-width: 540px;
-    max-width: 540px;
-    min-height: 520px;
-    box-sizing: border-box;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-}
-.centered-row {justify-content: center; align-items: center; margin-top: 24px; margin-bottom: 12px;}
-.centered-btn {width: 320px; margin: 0 auto;}
-.centered-json {max-width: 900px; margin: 0 auto;}
-""") as demo:
-    gr.Markdown("# Image Annotation Tools")
-    
+with gr.Blocks() as demo:
     with gr.Row():
-        # Point Drawing Section
-        with gr.Column(scale=1, elem_classes=["annotation-panel"]):
-            gr.Markdown("### Foreground image / Object image")
-            gr.Markdown("Add points on the image to create a better mask.")
-            
-            # Store points in a state variable
-            points = gr.State([])
-            
-            # Input image
-            input_image = gr.Image(
-                value=None,  # No default image
-                type="pil",
-                interactive=True,
-                height=400,
-                width=500
-            )
-            
-            # Handle click events
-            input_image.select(
-                on_image_click,
-                inputs=[input_image, points],
-                outputs=[input_image, points]
-            )
-        
-        # Bounding Box Section
-        with gr.Column(scale=1, elem_classes=["annotation-panel"]):
-            gr.Markdown("### background image")
-            gr.Markdown("create a bounding box to place your object with in")
-            annotator = image_annotator(
+        # Background image input
+        with gr.Column():
+            gr.Markdown("### Background image")
+            bg_annotator = image_annotator(
                 label_list=["object"],
                 label_colors=[(0, 255, 0)],
                 height=400,
                 width=500
             )
+        
+        # Reference image input
+        with gr.Column():
+            gr.Markdown("### Reference image")
+            ref_annotator = ImagePrompter(show_label=False)
+            point_output = gr.Dataframe(label="Points")
+            
+            ref_annotator.change(
+                scale_points,
+                inputs=[ref_annotator],
+                outputs=[gr.Image(show_label=False), point_output]
+            )
     
     # Process button and combined output
-    with gr.Row(elem_classes=["centered-row"]):
-        process_btn = gr.Button("Process", variant="primary", elem_classes=["centered-btn"])
-    with gr.Row(elem_classes=["centered-row"]):
-        combined_json = gr.JSON(label="Combined Coordinates", elem_classes=["centered-json"])
+    process_btn = gr.Button("Process")
+    combined_json = gr.JSON(label="Combined Coordinates")
+    result_image = gr.Image(label="Generated Result")
+    vis_image = gr.Image(label="Visualization")
     
     # Handle process button click
     process_btn.click(
         process_annotations,
-        inputs=[input_image, points, annotator],
-        outputs=[input_image, combined_json]
+        inputs=[bg_annotator, ref_annotator, point_output, bg_annotator],
+        outputs=[gr.Image(show_label=False), combined_json, result_image, vis_image]
     )
 
 if __name__ == "__main__":
