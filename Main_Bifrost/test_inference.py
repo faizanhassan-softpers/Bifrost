@@ -18,7 +18,7 @@ def main():
     gen_image, vis_image = run_inference(
         temp_dir_path=temp_dir,
         bg_image_path=bg_image_path,
-
+        bg_mask=bg_mask,
         ref_object_location=ref_object_location,
         # Optional parameters with default values
         bg_object_location=[0.6, 0.5],
