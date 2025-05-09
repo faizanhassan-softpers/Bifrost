@@ -6,6 +6,7 @@ from gradio_image_annotation import image_annotator
 import os
 import tempfile
 import uuid
+from run_inference_lib import run_inference
 
 def scale_points(prompts):
     image = prompts["image"]
@@ -151,8 +152,6 @@ def process_annotations(bg_prompts, ref_prompts, points_df, annotations):
     
     # Call run_inference if we have both points and bounding boxes
     if points and annotations and "boxes" in annotations:
-        # from run_inference_lib import run_inference
-        
         # Get the first bounding box coordinates
         box = annotations["boxes"][0]
         bg_mask = [
@@ -180,19 +179,19 @@ def process_annotations(bg_prompts, ref_prompts, points_df, annotations):
         print(f"ref_object_location: {ref_object_location}")
         print("===========================================\n")
         
-        # Commenting out the actual function call for now
-        # gen_image, vis_image = run_inference(
-        #     temp_dir_path=temp_dir_path,
-        #     bg_image_path=bg_image_path,
-        #     ref_image_path=ref_image_path,
-        #     bg_mask=bg_mask,
-        #     ref_object_location=ref_object_location
-        # )
-        # return img, output_text, gen_image, vis_image
+        # Call the actual inference function
+        gen_image, vis_image = run_inference(
+            temp_dir_path=temp_dir_path,
+            bg_image_path=bg_image_path,
+            ref_image_path=ref_image_path,
+            bg_mask=bg_mask,
+            ref_object_location=ref_object_location
+        )
+        return img, output_text, gen_image, vis_image
         
         # For testing, return dummy images
-        dummy_image = np.zeros((512, 512, 3), dtype=np.uint8)
-        return img, output_text, dummy_image, dummy_image
+        # dummy_image = np.zeros((512, 512, 3), dtype=np.uint8)
+        # return img, output_text, dummy_image, dummy_image
     
     # Return dummy images when no inference is performed
     dummy_image = np.zeros((512, 512, 3), dtype=np.uint8)
