@@ -367,62 +367,51 @@ def depth_mask_fusion(back_depth, ref_depth, back_mask, ref_mask, depth_scale=[0
     return back_depth, 1-tar_mask, selected_mask
 
 
-if __name__ == '__main__': 
-    temp_dir_path = './examples/temp'
-
+def run_inference(temp_dir_path, bg_image_path, ref_image_path, bg_mask, ref_object_location, 
+                 bg_object_location=[0.6, 0.5], depth=[0.1, 0.22], 
+                 pixel_num=0.02, mode='place', flip_image=False,
+                 sobel_color=False, sobel_threshold=50):
+    """
+    Run inference to generate a composite image.
+    
+    Args:
+        temp_dir_path (str): Path to temporary directory for storing intermediate files
+        bg_image_path (str): Path to background image
+        bg_mask (list): Background mask coordinates [x, y, w, h] in range [0, 1]
+        ref_object_location (list): Reference object location [x, y] in range [0, 1]
+        bg_object_location (list): Background object location [x, y] in range [0, 1]
+        depth (list): Range of scaled depth value [min, max]
+        pixel_num (float): Number of pixels added around mask for augmentation
+        mode (str): Mode for depth mask fusion ('place', 'replace', 'draw')
+        flip_image (bool): Whether to flip the reference image
+        sobel_color (bool): Whether to use color in Sobel edge detection
+        sobel_threshold (int): Threshold for Sobel edge detection
+    
+    Returns:
+        tuple: (generated_image, composite_image)
+    """
     # ==== Example for inferring a single image ===
-    ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'
+    # ref_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/object.jpg'
     ref_image_name = os.path.basename(ref_image_path)
     ref_image_mask_path = f"{temp_dir_path}/mask_{ref_image_name}"
 
-
-    # ref_image_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/object_mask.jpg'
-    # ref_image_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/object.png'
-
-    bg_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/background.jpg'
     bg_image_name = os.path.basename(bg_image_path)
     bg_mask_path = f"{temp_dir_path}/mask_{bg_image_name}"
 
-    # bg_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/background_mask.png'
-    # bg_image_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/Test/Depth/background.png'
-
-    # fused_depth_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth/fused_depth.png'
-    # fused_mask_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Mask/fused_mask.png'
     fused_depth_path = f"{temp_dir_path}/fused_depth_{bg_image_name}"
     fused_mask_path = f"{temp_dir_path}/fused_mask_{bg_image_name}"
 
-    # save_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res.png'
-    # save_compose_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Gen/gen_res_compose.png'
     save_path = f"{temp_dir_path}/gen_res_{ref_image_name}"
     save_compose_path = f"{temp_dir_path}/gen_res_compose_{ref_image_name}"
 
     input_folder = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input'
     output_depth_folder = f"{temp_dir_path}/DEPTH"
-    # output_folder = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Depth'
-    # [x, y, w, h] in the range of [0, 1]
-    bg_mask = [0.338, 0.521, 0.2, 0.32]
-    ref_object_location = [0.5, 0.45] # [x, y] in the range of [0, 1]
-    bg_object_location = [0.6, 0.5] # [x, y] in the range of [0, 1]
-    depth = [0.1, 0.22] # the range of scaled depth value
-    pixel_num = 0.02 # the number of pixels added around the mask for augmentation default 10
-    mode = 'place' # 'place', 'replace', 'draw
-    flip_image = False
-    sobel_color = False
-    sobel_threshold = 50
+
     start_time = time.time()
-
-    # using zero123 to generate new image with novel view
-    # given_image = cv2.imread(opt.input_image, cv2.IMREAD_UNCHANGED)
-    # given_image = cv2.cvtColor(given_image.copy(), cv2.COLOR_BGR2RGB)
-    # run_demo(opts=opt)
-
-    # reference image + reference mask
-    # You could use the demo of SAM to extract RGB-A image with masks
-    # https://segment-anything.com/demo
 
     if bg_mask[0]+bg_mask[2] > 1 or bg_mask[1]+bg_mask[3] > 1:
         print('The mask is out of range')
-        exit()
+        return None, None
 
     # reference image
     image = cv2.imread(ref_image_path, cv2.IMREAD_UNCHANGED)
@@ -432,26 +421,12 @@ if __name__ == '__main__':
 
     h, w = image.shape[0], image.shape[1]
 
-
-
     # background image
     back_image = cv2.imread(bg_image_path).astype(np.uint8)
     back_image = cv2.cvtColor(back_image, cv2.COLOR_BGR2RGB)
-    '''
-    image_gry = cv2.imread(ref_image_path, cv2.IMREAD_GRAYSCALE)
 
-    # mask = (image[:,:,-1] > 128).astype(np.uint8)
-    mask = (image_gry[:, :] < 253).astype(np.uint8)
-    # image = image[:,:,:-1]
-    image = cv2.cvtColor(image.copy(), cv2.COLOR_BGR2RGB)
-    h, w = image.shape[0], image.shape[1]
-    ref_image = image*mask[:, :, None]
-    ref_image = image 
-    ref_mask = mask
-    '''
     # Use SAM to predict the mask for reference image
     predictor.set_image(image)
-    # point_coords = np.array([[h*ref_object_location[1], w*ref_object_location[0]]])
     point_coords = np.array([[h*loc[1], w*loc[0]] for loc in ref_object_location])
     point_labels = np.ones(len(ref_object_location))
     masks, mask_scores, _ = predictor.predict(point_coords=point_coords,
@@ -460,11 +435,11 @@ if __name__ == '__main__':
     # save the mask image
     best_mask_index = np.argmax(mask_scores)
     mask = masks[best_mask_index].astype(np.uint8)
-    # cv2.imwrite(ref_image_mask_path, mask)
     cv2.imwrite(ref_image_mask_path, mask)
     mask = cv2.imread(ref_image_mask_path, cv2.IMREAD_UNCHANGED)
     ref_mask = (mask[:, :] > 0).astype(np.uint8)
     ref_image = image
+
     if mode == 'draw' or True:
         h_back, w_back = back_image.shape[0], back_image.shape[1]
         # Use SAM to predict the mask for background image
@@ -481,17 +456,9 @@ if __name__ == '__main__':
     # Get the depth map using DPT
     run(dpt_model, transform, input_folder, output_depth_folder)
 
-
-    # transform reference image style to the background image style
-    # aug = A.Compose([A.FDA([back_image], p=1, read_fn=lambda x: x)])
-    # transfered_ref_image = aug(image=image)['image']
-    # ref_image = transfered_ref_image
-
-
     tar_mask = np.zeros(back_image.shape[:2], np.uint8)
     tar_mask[int((bg_mask[1])*back_image.shape[0]):int((bg_mask[1]+bg_mask[3])*back_image.shape[0]),
                 int((bg_mask[0])*back_image.shape[1]):int((bg_mask[0]+bg_mask[2])*back_image.shape[1])] = 1
-
 
     # read the depth map predicted by DPT
     back_depth = cv2.imread(f'{output_depth_folder}/{os.path.splitext(bg_image_name)[0]}.png', cv2.IMREAD_UNCHANGED)
@@ -521,89 +488,37 @@ if __name__ == '__main__':
     elif mode == 'draw':
         tar_mask = cv2.imread(bg_mask_path, cv2.IMREAD_UNCHANGED)
         tar_mask = (tar_mask[:, :] > 0).astype(np.uint8)
-    # tar_mask = tar_mask < 128
-    # tar_mask = tar_mask.astype(np.uint8)
+
     if flip_image:
         ref_mask = cv2.flip(ref_mask, 1)
 
     tar_depth = cv2.imread(fused_depth_path, cv2.IMREAD_UNCHANGED)
     gen_image = inference_single_image(ref_image, ref_mask, back_image.copy(), tar_mask, occluded_mask, tar_depth, pixel_num, sobel_color, sobel_threshold)
-    # print("gen_image: ", gen_image.shape)
+    
     h,w = back_image.shape[0], back_image.shape[0]
     ref_image = cv2.resize(ref_image, (w,h))
     tar_depth = cv2.resize(tar_depth, (w,h))
-    # given_image = cv2.resize(given_image, (w,h))
     vis_image = cv2.hconcat([ref_image, back_image, gen_image])
 
     cv2.imwrite(save_compose_path, vis_image[:,:,::-1])
     cv2.imwrite(save_path, gen_image[:,:,::-1])
     end_time = time.time()
     print("Time: ", end_time-start_time)
+    
+    return gen_image, vis_image
 
-    '''
-    # ==== Example for inferring VITON-HD Test dataset ===
-
-    from omegaconf import OmegaConf
-    import os 
-    DConf = OmegaConf.load('./configs/datasets.yaml')
-    save_dir = '/home/mhf/dxl/Lingxiao/Codes/dreambooth/dreambooth_output_anydoor'
-    flag = False
-    if not os.path.exists(save_dir):
-        os.mkdir(save_dir)
-
-    test_dir = DConf.Test.VitonHDTest.image_dir
-    image_names = os.listdir(test_dir)
-    object_dir = '/home/mhf/dxl/Lingxiao/Codes/dreambooth/dreambooth_object'
-    bg_dir = '/home/mhf/dxl/Lingxiao/Codes/dreambooth/bg_test'
-    # output_dir = '/mnt/workspace/gongkaixiong/lingxiaoli/Codes/dreambooth/dreambooth_output_anydoor'
-    image_names = os.listdir(object_dir)
-    for image_name in image_names:
-        if image_name.endswith('.jpg'):
-            ref_image_path = os.path.join(object_dir, image_name)
-            print("ref_image_path: ", ref_image_path)
-            background_names = os.listdir(bg_dir)
-            for background_name in tqdm(background_names):
-                if not background_name.endswith("mask.jpg"):
-                    print("background_name: ", background_name)
-                    background_path = os.path.join(bg_dir, background_name)
-                    count = background_name.split('_')[-1].split('.')[0]
-                    # background = cv2.imread(background_path, cv2.IMREAD_UNCHANGED)
-                    # background = cv2.cvtColor(background, cv2.COLOR_BGR2RGB)
-                    # end_string = background_name.split('.')[0].split('_')[-1]
-                    # backgroun_mask = cv2.imread(background_path.replace('.jpg', '_mask.jpg'), cv2.IMREAD_UNCHANGED)
-                    
-                    # ref_image_path = os.path.join(test_dir, image_name)
-                    tar_image_path = background_path
-                    ref_mask_path = ref_image_path.replace('/dreambooth_object/','/object_mask/')
-                    tar_mask_path = tar_image_path.replace('.jpg', '_mask.jpg')
-
-                    ref_image = cv2.imread(ref_image_path)
-                    ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
-
-                    gt_image = cv2.imread(tar_image_path)
-                    gt_image = cv2.cvtColor(gt_image, cv2.COLOR_BGR2RGB)
-
-                    ref_mask = (cv2.imread(ref_mask_path) > 0).astype(np.uint8)[:,:,0]
-
-                    tar_mask = Image.open(tar_mask_path ).convert('P')
-                    tar_mask= np.array(tar_mask)
-                    tar_mask = (tar_mask < 1).astype(np.uint8)
-
-                    gen_image = inference_single_image(ref_image, ref_mask, gt_image.copy(), tar_mask)
-                    dir_name = image_name.split('.')[0]
-                    if not os.path.exists(os.path.join(save_dir, dir_name)):
-                        os.mkdir(os.path.join(save_dir, dir_name))
-                    gen_path = os.path.join(save_dir, dir_name, str(count)+'.jpg')
-                    # vis_image = cv2.hconcat([ref_image, gt_image, gen_image])
-                    gen_image = cv2.cvtColor(gen_image, cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(gen_path, gen_image)
-                    # count += 1
-                    flag = True
-                # if flag:
-                #     break
-            # if flag:
-            #     break    
-    '''
+if __name__ == '__main__': 
+    temp_dir_path = './examples/temp'
+    bg_image_path = '/home/ec2-user/dev/Bifrost/Main_Bifrost/examples/TEST/Input/background.jpg'
+    bg_mask = [0.338, 0.521, 0.2, 0.32]
+    ref_object_location = [0.5, 0.45]
+    
+    gen_image, vis_image = run_inference(
+        temp_dir_path=temp_dir_path,
+        bg_image_path=bg_image_path,
+        bg_mask=bg_mask,
+        ref_object_location=ref_object_location
+    )
 
     
 
